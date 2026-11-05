@@ -56,6 +56,9 @@ class HarnessClient:
         self._proc: subprocess.Popen[str] | None = None
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
+        # Held across the runtime spawn so concurrent first callers cannot each
+        # launch a process; see start().
+        self._launch_lock = threading.Lock()
         self._responses: dict[str, queue.Queue[JsonValue | BaseException]] = {}
         self._notifications: queue.Queue[Notification | BaseException] = queue.Queue()
         self._notification_subscribers: dict[
@@ -76,29 +79,43 @@ class HarnessClient:
         self.close()
 
     def start(self) -> None:
-        if self._proc is not None:
-            return
-        with self._lock:
-            self._session_parents.clear()
-        env = os.environ.copy()
-        if self.config.env:
-            env.update(self.config.env)
-        args = list(self._launch_args or self._default_launch_args(env))
-        self._proc = subprocess.Popen(
-            args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            cwd=None
-            if self.config.cwd is None
-            else str(Path(self.config.cwd).resolve()),
-            env=env,
-            bufsize=1,
-        )
-        self._start_reader_thread()
-        self._start_stderr_thread()
+        """Launch the runtime once, whatever order callers arrive in.
+
+        The check and the spawn have to be one step: a caller that finds no
+        runtime must be the only one that creates it. Without that, two callers
+        both pass the check, both spawn, and the assignment keeps only the
+        second — leaving the first running as an orphan whose stdout is still
+        wired to a reader that now belongs to the other process. Runs then wait
+        for events that arrive on the pipe nobody reads.
+
+        The launch lock is not the state lock: state changes stay short, while
+        this one is held across the spawn so a second caller waits for the
+        start instead of repeating it.
+        """
+        with self._launch_lock:
+            if self._proc is not None:
+                return
+            with self._lock:
+                self._session_parents.clear()
+            env = os.environ.copy()
+            if self.config.env:
+                env.update(self.config.env)
+            args = list(self._launch_args or self._default_launch_args(env))
+            self._proc = subprocess.Popen(
+                args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                cwd=None
+                if self.config.cwd is None
+                else str(Path(self.config.cwd).resolve()),
+                env=env,
+                bufsize=1,
+            )
+            self._start_reader_thread()
+            self._start_stderr_thread()
 
     def close(self) -> None:
         """Close the runtime after a bounded opportunity to flush durable state."""

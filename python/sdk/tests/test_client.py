@@ -1313,3 +1313,44 @@ def test_client_reports_missing_bundled_runtime_dependency(
 
     with pytest.raises(FileNotFoundError, match="Install deepseek-harness-runtime-bin"):
         HarnessClient(HarnessConfig(dsh_home="/explicit/home")).start()
+
+
+def test_concurrent_start_launches_exactly_one_runtime(tmp_path: Path) -> None:
+    """Eight threads asking for the runtime at once must produce one process.
+
+    Runs execute on their own worker threads, so several can call start()
+    together. When the check and the spawn are not one step, each caller
+    launches its own runtime; the last assignment wins and the others keep
+    running as orphans whose stdout nobody reads. The run then waits for
+    events that arrive on the wrong pipe.
+    """
+    counter = tmp_path / "launches.txt"
+    script = tmp_path / "fake_runtime.py"
+    script.write_text(
+        f"""
+import sys
+with open({str(counter)!r}, "a") as handle:
+    handle.write("x")
+for line in sys.stdin:
+    pass
+"""
+    )
+
+    client = HarnessClient(_launch_args=(sys.executable, str(script)))
+    threads = [threading.Thread(target=client.start) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    # The spawned process writes its marker after the interpreter starts, so
+    # give it a bounded moment rather than reading the instant start() returns.
+    deadline = time.monotonic() + 10
+    launches = ""
+    while time.monotonic() < deadline:
+        launches = counter.read_text() if counter.exists() else ""
+        if launches:
+            break
+        time.sleep(0.05)
+    client.close()
+    assert len(launches) == 1, f"each caller spawned its own runtime: {len(launches)}"

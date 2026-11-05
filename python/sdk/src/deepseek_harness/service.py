@@ -52,12 +52,31 @@ class HarnessService:
         self._harness: DeepSeekHarness | None = None
         self._runs: dict[str, _Run] = {}
         self._lock = threading.Lock()
+        # Guards the harness construction and its one-time start. Kept apart
+        # from ``_lock``, which guards the run registry: holding the registry
+        # lock across a spawn would block every status poll for its duration.
+        self._start_lock = threading.Lock()
 
     def _ensure_started(self) -> DeepSeekHarness:
-        if self._harness is None:
-            self._harness = DeepSeekHarness(self._config)
-        self._harness.start()
-        return self._harness
+        """Start the harness once, even when several runs ask at the same time.
+
+        Each run executes on its own worker thread, so two runs arriving
+        together reach this method together. ``start()`` checks whether a
+        runtime already exists and then spawns one, with no lock between the
+        check and the spawn: concurrent callers each pass the check and each
+        launch a runtime. The process that loses the assignment keeps running
+        as an orphan, and the reader thread ends up watching a pipe whose
+        writer is gone — the run then never receives its events.
+
+        The lock makes the whole start one step. It is held across the spawn
+        on purpose: the expensive part happens once, and a caller that arrives
+        later simply waits for that one start instead of beginning its own.
+        """
+        with self._start_lock:
+            if self._harness is None:
+                self._harness = DeepSeekHarness(self._config)
+            self._harness.start()
+            return self._harness
 
     def start_run(self, task: dict[str, Any]) -> str:
         """Accept one task and begin executing it on a worker thread.
