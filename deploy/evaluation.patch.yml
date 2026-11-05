@@ -1,0 +1,52 @@
+# Evaluation deployment for the APUS harness.
+#
+# The `sdk` profile registers only `deepseek-official`, whose protocol is
+# Anthropic Messages against api.deepseek.com. An evaluation gateway commonly
+# serves OpenAI chat-completions instead, so this overlay mounts the dormant
+# `llm-pi-ai` twin with the deployment's own endpoint, and activates the three
+# plugins that make this harness APUS rather than the plain harness: Jev
+# decisions, Continuum memory, and System3 routing.
+#
+# No host, model or credential is named here; every one comes from the
+# environment, so one image serves every deployment.
+- id: llm-pi-ai
+  config:
+    providers:
+      gateway:
+        displayName: Evaluation Gateway
+        api: openai-completions
+        baseURL: !!js 'process.env.LLM_BASE_URL?.trim()'
+        apiKeyEnv: LLM_API_KEY
+        models:
+          - id: !!js 'process.env.LLM_MODEL?.trim()'
+            name: !!js 'process.env.LLM_MODEL?.trim()'
+            # pi-ai derives the output budget from this window
+            # (`contextWindow - estimated input - 4096`, floored at 1), and an
+            # understated value turns a large prompt into a one-token reply.
+            contextWindow: !!js 'Number(process.env.LLM_CONTEXT_WINDOW || 1048576)'
+            maxTokens: !!js 'Number(process.env.LLM_MAX_TOKENS || 8192)'
+
+- insert:
+    # Jev decides; the harness records what it decided.
+    - id: jev
+      name: /workspace/packages/experimental/apus-dsh-jev-plugin/lib/index.js
+      config:
+        endpoint: !!js 'process.env.JEV_ENDPOINT?.trim()'
+        model: !!js 'process.env.JEV_MODEL?.trim()'
+        apiKeyEnv: JEV_API_KEY
+
+    # Continuum's two halves: the memory service and the Jev bridge that
+    # admits and indexes what the service writes.
+    - id: continuum-memory
+      name: /workspace/packages/context/continuum/lib/index.js
+      config:
+        enabled: !!js 'process.env.CONTINUUM_MEMORY_ENABLED !== "false"'
+        mode: !!js 'process.env.CONTINUUM_MEMORY_MODE || "active"'
+
+    - id: continuum-jev
+      name: /workspace/packages/experimental/continuum-jev/lib/index.js
+
+    # System3 routes an incoming request to a model before the step opens, and
+    # records the choice; without it the trace cannot say why this model.
+    - id: system3
+      name: /workspace/packages/experimental/system3/lib/index.js

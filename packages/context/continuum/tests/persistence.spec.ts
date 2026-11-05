@@ -45,6 +45,17 @@ describe('Continuum L1 index events', () => {
       sourceRefs: [{ sessionId: session.id, eventSeq: source.seq }] })
   })
 
+  it('records the admission path and tag source without changing the fold', () => {
+    const session = Session.create(SessionId('index-admission'))
+    const source = human(session, 'The release is Friday.')
+    const id = MemoryId(`index-admission:${String(source.seq)}`)
+    const entry = { id, scope: 'workspace', tags: ['work'], source: { sessionId: session.id, eventSeq: source.seq } }
+    const event = appendMemoryIndexEvent(session, entry, { source: 'compaction', tagSource: 'reflex' })
+    expect(event.data).toEqual({ operation: 'add', entry, admission: { source: 'compaction', tagSource: 'reflex' } })
+    expect(foldMemoryRecordEvents(session.snapshotEvents(), new MemoryRecordStore()).get(id))
+      .toMatchObject({ content: 'The release is Friday.', status: 'active' })
+  })
+
   it.each(['missing', 'generated'] as const)('refuses an index entry whose source is %s', (kind) => {
     const session = Session.create(SessionId('index-fold-bad'))
     session.append('turn/start', { turn: 1 })
@@ -56,6 +67,26 @@ describe('Continuum L1 index events', () => {
 })
 
 describe('Continuum record events', () => {
+  it('records the replaced record and read invalidation on corrections only', () => {
+    const session = Session.create(SessionId('record-predecessor'))
+    session.append('turn/start', { turn: 1 })
+    const store = new MemoryRecordStore()
+    const created = store.create({
+      id: MemoryId('fact-v1'), kind: 'fact', scope: 'workspace', content: 'Old fact.',
+      sourceRefs: [{ sessionId: session.id, eventSeq: SessionSeq(0) }],
+    })
+    appendMemoryRecordEvent(session, 'create', created)
+    const replacement = store.supersede(created.id, created.revision, {
+      id: MemoryId('fact-v2'), kind: 'fact', scope: 'workspace', content: 'New fact.', sourceRefs: created.sourceRefs,
+    })
+    appendMemoryRecordEvent(session, 'supersede', replacement, created)
+    const events = session.snapshotEvents().filter(event => event.type === 'continuum/memory-record')
+    expect(events[0]?.data).toEqual({ operation: 'create', record: created })
+    expect(events[1]?.data).toEqual({ operation: 'supersede', record: replacement, previous: created, invalidatesReads: true })
+    expect(foldMemoryRecordEvents(session.snapshotEvents(), new MemoryRecordStore()).snapshot())
+      .toEqual([{ ...created, status: 'superseded', revision: 2 }, replacement])
+  })
+
   it('flushes a record history and rebuilds it after a Context restart', async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-continuum-jsonl-'))
     roots.push(root)

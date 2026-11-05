@@ -15,7 +15,7 @@ import type { Scoped } from '@deepseek-ai/dsh-scope'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, SessionLogOffset, SessionSeq } from './types.ts'
 import type { TypertLookup } from '@deepseek-ai/dsh-typert-protocol'
-import type { CreateSessionOptions, EpochHeader, PrepareSessionOptions, RequestContext, SessionEvent, SessionEventMap, SessionEventType, SessionHeader, SessionId, SessionSeedEventState, SurfaceIntent, SurfaceEventType } from './types.ts'
+import type { CreateSessionOptions, EpochHeader, PrepareSessionOptions, RequestContext, RequestContextEventData, SessionEvent, SessionEventMap, SessionEventType, SessionHeader, SessionId, SessionSeedEventState, SurfaceIntent, SurfaceEventType } from './types.ts'
 import { SurfaceManager, validateSessionEventData, validateSurfaceMetadata } from './surface.ts'
 import type { SessionSurface, SessionMessageProjection } from './surface.ts'
 import { foldRequestHeader } from './request-header.ts'
@@ -199,6 +199,22 @@ export function adoptSessionEvent<T extends SessionEvent>(event: T): T {
  */
 export function snapshotSessionEvent<T extends SessionEvent>(event: T): T {
   return adoptSessionEvent(structuredClone(event))
+}
+
+/**
+ * Project only the route fields of a request-context record. The append also
+ * carries assembly digests, which describe that one request and must not leak
+ * into the live route metadata consumers compare across requests.
+ * @param data - the committed request-context payload.
+ * @returns route metadata with canonical absent optional fields omitted.
+ */
+function routeContext(data: RequestContextEventData): RequestContext {
+  return {
+    provider: data.provider,
+    model: data.model,
+    ...data.contextWindow === undefined ? {} : { contextWindow: data.contextWindow },
+    ...data.systemPromptUpdate === undefined ? {} : { systemPromptUpdate: data.systemPromptUpdate },
+  }
 }
 
 /** Validate the fixed event envelope after one-pass JSON materialization. */
@@ -809,7 +825,7 @@ export class Session {
   requestContext(): RequestContext | undefined {
     if (this.contextFoldSeq < this.log.length) {
       for (const event of this.log.slice(this.contextFoldSeq)) {
-        if (event.type === 'request/context') this.contextFold = deepFreeze({ ...event.data })
+        if (event.type === 'request/context') this.contextFold = deepFreeze(routeContext(event.data))
       }
       this.contextFoldSeq = this.log.length
     }

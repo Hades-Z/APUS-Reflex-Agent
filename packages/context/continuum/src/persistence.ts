@@ -1,10 +1,20 @@
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { MemoryId, MemoryRecord, MemoryRecordStore, MemorySourceRef, NewMemoryRecord } from './records.ts'
+import type { MemoryId, MemoryRecord, MemoryRecordStore, MemorySourceRef, MemoryStatus, NewMemoryRecord } from './records.ts'
+import type { MemoryDroppedRecord } from './retrieval.ts'
+import type { MemoryIndexRebuildResult } from './memory-index.ts'
 
 /** Durable operation written to the existing Session event log. */
 export type MemoryRecordOperation = 'create' | 'supersede' | 'deactivate'
+
+/** The record a supersede or deactivate transition replaced, before that transition. */
+export interface MemoryRecordPredecessor {
+  readonly id: MemoryId
+  readonly revision: number
+  readonly status: MemoryStatus
+  readonly sourceRefs: readonly [MemorySourceRef, ...MemorySourceRef[]]
+}
 
 /** Event payload for one accepted Continuum record transition. */
 export interface MemoryRecordEventData {
@@ -12,6 +22,13 @@ export interface MemoryRecordEventData {
   readonly operation: MemoryRecordOperation
   /** Complete post-transition record snapshot. */
   readonly record: MemoryRecord
+  /**
+   * Pre-transition record snapshot for a supersede or deactivate transition, including its source references;
+   * absent for create and on historical events.
+   */
+  readonly previous?: MemoryRecordPredecessor
+  /** Present when the transition invalidated in-flight reads; absent for create and on historical events. */
+  readonly invalidatesReads?: true
 }
 
 /** One exact event resolved from a source reference. */
@@ -30,11 +47,113 @@ export interface MemoryIndexEntry {
   readonly source: MemorySourceRef
 }
 
+/** Which admission path produced one L1 index entry and how its tags were decided. */
+export interface MemoryIndexAdmission {
+  /** Which admission path produced the entry: compaction, or a committed user message. */
+  readonly source: 'compaction' | 'user-message'
+  /** Reflex supplied the tags, the admitter failed and every candidate was kept untagged, or no admitter judged it. */
+  readonly tagSource: 'reflex' | 'fallback-untagged' | 'unjudged'
+}
+
 /** Event payload that adds one entry to the L1 index. */
 export interface MemoryIndexEventData {
   readonly operation: 'add'
   readonly entry: MemoryIndexEntry
+  /** Admission path that produced the entry; absent on historical events. */
+  readonly admission?: MemoryIndexAdmission
 }
+
+/** Effective retrieval limits applied before any candidate reached the model. */
+export interface MemoryRetrievalLimits {
+  readonly maxCandidates: number
+  readonly maxExcerptBytes: number
+  readonly maxTotalBytes: number
+  /** Candidates offered to a mounted selector; equal to `maxCandidates` without one. */
+  readonly maxPool: number
+}
+
+/** Event payload for the start of one memory retrieval, before ranking limits apply. */
+export interface MemoryRetrievalEventData {
+  /** Where the query came from; the current consumer always uses the latest human message with text. */
+  readonly querySource: 'latest-user-message'
+  /** Query terms used for scoring, truncated to {@link MAX_RECORDED_QUERY_CHARS} characters. */
+  readonly query: string
+  /** Full UTF-16 length of the query, before recording truncation. */
+  readonly queryChars: number
+  /** Whether `query` is a prefix of the full query text. */
+  readonly queryTruncated: boolean
+  /** Exact scopes the read was authorized for; absent when the caller owns no scopes. */
+  readonly scopes?: readonly string[]
+  readonly candidatePool: 'lexical' | 'all'
+  readonly limits: MemoryRetrievalLimits
+  /** Active records in the authorized projection. */
+  readonly activeRecords: number
+  /** Records left after the inverted-index prefilter. */
+  readonly candidateRecords: number
+  /** Normalized query terms used for lexical scoring, at most {@link MAX_RECORDED_RECORDS} of them. */
+  readonly terms: readonly string[]
+  /** Matched records before candidate and byte limits; may exceed `candidates` in the scored event. */
+  readonly matchedRecords: number
+  /** Whether an optional selector receives the candidate pool after this read. */
+  readonly selectorMounted: boolean
+}
+
+/** One ranked candidate with its lexical score and the query terms it matched. */
+export interface MemoryScoredCandidate {
+  readonly id: MemoryId
+  readonly score: number
+  readonly matchedTerms: readonly string[]
+}
+
+/** Event payload listing the lexical ranking that candidate limits then filter. */
+export interface MemoryScoredEventData {
+  /** Matched candidates in ranked order, at most {@link MAX_RECORDED_RECORDS} entries. */
+  readonly candidates: readonly MemoryScoredCandidate[]
+  /** Complete matched candidate count, including entries omitted from `candidates`. */
+  readonly matchedRecords: number
+}
+
+/** Event payload for one candidate or byte limit that excluded records. */
+export interface MemoryBudgetEventData {
+  /** `recall` before any selector; `selection` after the selector's proposal. */
+  readonly stage: 'recall' | 'selection'
+  /** Excluded records in ranked order, at most {@link MAX_RECORDED_RECORDS} entries. */
+  readonly dropped: readonly MemoryDroppedRecord[]
+  /** Complete excluded count, including entries omitted from `dropped`. */
+  readonly droppedRecords: number
+  /** UTF-8 bytes of the recall that this stage produced. */
+  readonly bytes: number
+}
+
+/** Selector outcome recorded with an injection, so advice and applied recall are distinguishable. */
+export interface MemorySelectionRecord {
+  readonly mode: 'off' | 'shadow' | 'active'
+  readonly outcome: 'off' | 'baseline' | 'jev' | 'unknown'
+  /**
+   * IDs the selector returned and the consumer applied. Shadow mode returns the baseline order, not the Jev advice;
+   * the advice order of that round is in the paired `continuum/memory-decision` evaluation.
+   */
+  readonly selectedIds: readonly string[]
+  /** Baseline recall the deterministic path would have injected. */
+  readonly baselineIds: readonly string[]
+}
+
+/** Event payload for the record set that reached the model. */
+export interface MemoryInjectedEventData {
+  /** Injected record IDs in model order, at most {@link MAX_RECORDED_RECORDS} entries. */
+  readonly injectedIds: readonly string[]
+  /** Complete injected count, including entries omitted from `injectedIds`. */
+  readonly injectedRecords: number
+  /** UTF-8 bytes of the injected recall. */
+  readonly bytes: number
+  /** Selector outcome; absent on the deterministic path. */
+  readonly selection?: MemorySelectionRecord
+}
+
+/** Maximum UTF-16 characters of a query or term recorded in a retrieval event. */
+export const MAX_RECORDED_QUERY_CHARS = 500
+/** Maximum IDs or candidates one retrieval event records; paired counts stay complete. */
+export const MAX_RECORDED_RECORDS = 64
 
 declare module '@deepseek-ai/dsh-session/types' {
   interface SessionEventMap {
@@ -42,7 +161,43 @@ declare module '@deepseek-ai/dsh-session/types' {
     'continuum/memory-record': MemoryRecordEventData
     /** An L1 index entry pointing at an original human message; log-only and never model-visible. */
     'continuum/memory-index': MemoryIndexEventData
+    /** One memory retrieval's query, authorization scope and applied limits; log-only and never model-visible. */
+    'continuum/memory-retrieval': MemoryRetrievalEventData
+    /** The lexical ranking one retrieval produced; log-only and never model-visible. */
+    'continuum/memory-scored': MemoryScoredEventData
+    /** Records a candidate or byte limit excluded before injection; log-only and never model-visible. */
+    'continuum/memory-budgeted': MemoryBudgetEventData
+    /** The record set one retrieval injected into the next model request; log-only and never model-visible. */
+    'continuum/memory-injected': MemoryInjectedEventData
+    /** One rebuild of the disposable lexical index, whole or bounded; log-only and never model-visible. */
+    'continuum/memory-index-rebuilt': MemoryIndexRebuiltEventData
+    /** A newer record snapshot queued for the next bounded index rebuild; log-only and never model-visible. */
+    'continuum/memory-index-queued': MemoryIndexQueuedEventData
   }
+}
+
+/** Event payload for one rebuild of the derived lexical index. */
+export interface MemoryIndexRebuiltEventData {
+  /**
+   * `full` rebuilds from the whole authoritative projection; `bounded` rebuilds
+   * at most `limit` queued snapshots. The index itself is disposable state: it
+   * is never authoritative, and a reader uses these counts to tell how far it
+   * lagged behind the record log at this moment.
+   */
+  readonly scope: 'full' | 'bounded'
+  /** Records represented by the index after this rebuild. */
+  readonly indexedRecords: number
+  /** Snapshots still waiting for a rebuild after this one. */
+  readonly pendingRecords: number
+  /** How many queued snapshots this rebuild consumed; absent on a full rebuild. */
+  readonly consumed?: number
+}
+
+/** Event payload for one record snapshot queued into the derived index. */
+export interface MemoryIndexQueuedEventData {
+  readonly recordId: MemoryId
+  /** Queue depth after this enqueue, before the bounded rebuild drains it. */
+  readonly pendingRecords: number
 }
 
 /**
@@ -58,13 +213,59 @@ export function memorySourceText(event: SessionEvent): string {
 }
 
 /**
+ * Append the outcome of one derived-index rebuild to the Session log.
+ *
+ * The index is disposable and never authoritative, so these counts are the only
+ * way a reader can tell how far retrieval's working set lagged the record log at
+ * the moment it was rebuilt.
+ * @param session - live Session that owns the durable event log.
+ * @param result - counts the rebuild reported.
+ * @param scope - whole projection or bounded drain of the queue.
+ * @param consumed - queued snapshots this rebuild consumed; omit for a full rebuild.
+ * @returns the appended event with its assigned sequence number.
+ */
+export function appendMemoryIndexRebuiltEvent(
+  session: Session,
+  result: MemoryIndexRebuildResult,
+  scope: 'full' | 'bounded',
+  consumed?: number,
+): SessionEvent<'continuum/memory-index-rebuilt'> {
+  return session.append('continuum/memory-index-rebuilt', {
+    scope,
+    indexedRecords: result.indexedRecords,
+    pendingRecords: result.pendingRecords,
+    ...(consumed === undefined ? {} : { consumed }),
+  })
+}
+
+/**
+ * Append one record snapshot entering the derived index queue.
+ * @param session - live Session that owns the durable event log.
+ * @param recordId - record whose newer snapshot was queued.
+ * @param pendingRecords - queue depth after the enqueue.
+ * @returns the appended event with its assigned sequence number.
+ */
+export function appendMemoryIndexQueuedEvent(
+  session: Session,
+  recordId: MemoryId,
+  pendingRecords: number,
+): SessionEvent<'continuum/memory-index-queued'> {
+  return session.append('continuum/memory-index-queued', { recordId, pendingRecords })
+}
+
+/**
  * Append one L1 index entry to the Session log.
  * @param session - live Session that owns the durable event log.
  * @param entry - entry whose source is a human message of the same Session.
+ * @param admission - admission path and tag source; omit only when the caller owns that fact.
  * @returns the appended event with its assigned sequence number.
  */
-export function appendMemoryIndexEvent(session: Session, entry: MemoryIndexEntry): SessionEvent<'continuum/memory-index'> {
-  return session.append('continuum/memory-index', { operation: 'add', entry })
+export function appendMemoryIndexEvent(
+  session: Session,
+  entry: MemoryIndexEntry,
+  admission?: MemoryIndexAdmission,
+): SessionEvent<'continuum/memory-index'> {
+  return session.append('continuum/memory-index', { operation: 'add', entry, ...(admission === undefined ? {} : { admission }) })
 }
 
 /**
@@ -72,14 +273,20 @@ export function appendMemoryIndexEvent(session: Session, entry: MemoryIndexEntry
  * @param session - live Session that owns the durable event log.
  * @param operation - transition represented by the record snapshot.
  * @param record - post-transition record accepted by the caller's store.
+ * @param previous - pre-transition record for supersede or deactivate; omit for create.
  * @returns the appended event with its assigned sequence number.
  */
 export function appendMemoryRecordEvent(
   session: Session,
   operation: MemoryRecordOperation,
   record: MemoryRecord,
+  previous?: MemoryRecordPredecessor,
 ): SessionEvent<'continuum/memory-record'> {
-  return session.append('continuum/memory-record', { operation, record })
+  return session.append('continuum/memory-record', {
+    operation, record,
+    ...(previous === undefined ? {} : { previous }),
+    ...(operation === 'create' ? {} : { invalidatesReads: true as const }),
+  })
 }
 
 /**
@@ -136,13 +343,18 @@ export function foldMemoryRecordEvents(
   let bySeq: Map<number, SessionEvent> | undefined
   for (const event of events) {
     if (event.type === 'continuum/memory-index') {
-      bySeq ??= new Map(events.map(candidate => [Number(candidate.seq), candidate]))
       const { entry } = event.data
+      tags?.set(entry.id, entry.tags)
+      // A live write appends the record first and its index second, while the
+      // compaction path writes the index first. Replay accepts either: an index
+      // whose record already exists only contributes its tags, and the content
+      // it would rebuild is already in the store from the record event.
+      if (store.get(entry.id) !== undefined) continue
+      bySeq ??= new Map(events.map(candidate => [Number(candidate.seq), candidate]))
       const source = bySeq.get(Number(entry.source.eventSeq))
       const content = source === undefined ? '' : memorySourceText(source)
       if (content.length === 0) throw new Error(`memory ${entry.id} index source ${String(entry.source.eventSeq)} has no human text`)
       store.create({ id: entry.id, kind: 'fact', scope: entry.scope, content, sourceRefs: [entry.source] })
-      tags?.set(entry.id, entry.tags)
       continue
     }
     if (event.type !== 'continuum/memory-record') continue

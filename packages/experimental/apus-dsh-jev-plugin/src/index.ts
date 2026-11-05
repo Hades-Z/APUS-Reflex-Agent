@@ -53,8 +53,13 @@ export interface Config {
   readonly enabled: Volatile<boolean>
   /** System One gateway URL; empty with model leaves the provider unconfigured. Credentials use apiKeyEnv. */
   readonly endpoint: Volatile<string>
-  /** Wire protocol; the official API does not receive the OpenJev effort extension. @default 'openjev' */
-  readonly protocol: Volatile<'openjev' | 'typesafe'>
+  /**
+   * Wire protocol. `openjev`/`typesafe` speak the System One API;
+   * `chat-completions` drives any OpenAI-compatible endpoint by reading each
+   * candidate's yes/no verdict probability.
+   * @default 'openjev'
+   */
+  readonly protocol: Volatile<'openjev' | 'typesafe' | 'chat-completions'>
   /** Model identifier used when a decision request omits its model; empty with endpoint permits first-run settings. */
   readonly model: Volatile<string>
   /** Decision effort used when a request omits it. @default 'low' */
@@ -107,7 +112,7 @@ export default class Jev extends TypertRemoteService {
   static Config = z.object({
     enabled: z.boolean().default(true).volatile(),
     endpoint: z.string().default('').volatile(),
-    protocol: z.union([z.const('openjev'), z.const('typesafe')]).default('openjev').volatile(),
+    protocol: z.union([z.const('openjev'), z.const('typesafe'), z.const('chat-completions')]).default('openjev').volatile(),
     model: z.string().max(256).default('').volatile(),
     effort: z.union([z.const('low'), z.const('high')]).default('low').volatile(),
     timeoutMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(DEFAULT_TIMEOUT_MS).volatile(),

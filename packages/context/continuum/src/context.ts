@@ -3,7 +3,12 @@ import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { MemoryId, MemoryRecordStore } from './records.ts'
-import { budgetMemoryWorkingSet, renderMemoryWorkingSet, retrieveMemoryWorkingSet, type MemoryRetrievalConfig } from './retrieval.ts'
+import {
+  budgetMemoryWorkingSetWithDrops, renderMemoryWorkingSet, retrieveMemoryWorkingSet, retrieveMemoryWorkingSetWithReport,
+  type MemoryCandidatePool, type MemoryRetrievalConfig,
+} from './retrieval.ts'
+import { MAX_RECORDED_RECORDS, type MemoryRetrievalLimits } from './persistence.ts'
+import { recordMemoryRetrieval, type MemoryRetrievalRecorder } from './retrieval-events.ts'
 import type { ContinuumMemoryController, ContinuumMemoryPrincipal } from './policy.ts'
 
 /** Model-visible source for one bounded Continuum memory snapshot. */
@@ -30,6 +35,13 @@ export interface ContinuumMemoryContextConfig extends MemoryRetrievalConfig {
    * `maxTotalBytes`. Omitted means `maxCandidates`.
    */
   readonly maxPool?: number | undefined
+  /** Admission mode recorded with selector decisions. Omitted means `explicit`. */
+  readonly admission?: 'explicit' | 'user-message' | 'compaction' | undefined
+  /**
+   * Record each read's query, ranking and injection as `continuum/memory-*` events. Off by default so an existing
+   * composition keeps its current log.
+   */
+  readonly trace?: boolean | undefined
 }
 
 /** Candidate passed to the optional mounted Reflex selector. */
@@ -40,6 +52,17 @@ export interface ContinuumMemorySelectionCandidate {
   readonly score: number
   /** L1 index tags of the record; empty for untagged records. */
   readonly tags: readonly string[]
+}
+
+/** Effective retrieval limits and admission mode a caller applied before selection. */
+export interface ContinuumMemorySelectionLimits {
+  readonly maxCandidates: number
+  readonly maxExcerptBytes: number
+  readonly maxTotalBytes: number
+  readonly candidatePool: MemoryCandidatePool
+  /** Candidate pool offered to the selector; equal to `maxCandidates` when unset. */
+  readonly maxPool: number
+  readonly admission: 'explicit' | 'user-message' | 'compaction'
 }
 
 /** Minimal replayable outcome returned by a mounted Reflex selector. */
@@ -56,7 +79,13 @@ export interface ContinuumMemorySelection {
 export interface ContinuumMemorySelector {
   select(
     agent: Agent,
-    input: { readonly query: string; readonly candidates: readonly ContinuumMemorySelectionCandidate[]; readonly isCurrent: () => boolean },
+    input: {
+      readonly query: string
+      readonly candidates: readonly ContinuumMemorySelectionCandidate[]
+      readonly isCurrent: () => boolean
+      /** Applied limits and admission mode for the receipt; omitted when the caller does not own them. */
+      readonly limits?: ContinuumMemorySelectionLimits
+    },
     signal: AbortSignal,
   ): Promise<ContinuumMemorySelection>
 }
@@ -127,7 +156,15 @@ export function installContinuumMemoryContext(
     const query = latestUserText(messages)
     if (store === undefined || query === undefined) return decision
     signal.throwIfAborted()
-    const workingSet = retrieveMemoryWorkingSet(store, config, query)
+    const traced = config.trace === true
+    const outcome = traced ? retrieveMemoryWorkingSetWithReport(store, config, query) : undefined
+    const workingSet = outcome?.workingSet ?? retrieveMemoryWorkingSet(store, config, query)
+    if (traced && outcome !== undefined) {
+      recordMemoryRetrieval(retrievalRecorder(ctx, agent), {
+        query, limits: retrievalLimits(config), selectorMounted: false, report: outcome.report,
+        ...(workingSet.candidates.length === 0 ? {} : { injection: { workingSet, dropped: [] } }),
+      })
+    }
     if (workingSet.candidates.length === 0) return decision
     return { ...decision, messages: [...decision.messages, recallMessage(workingSet)] }
   })
@@ -145,7 +182,7 @@ export function installContinuumMemoryContext(
  * @param ctx - Cordis context that owns AgentLoop events.
  * @param controllerOf - per-agent Continuum controller resolver.
  * @param principalOf - exact scope resolver for the current agent.
- * @param config - retrieval and byte limits.
+ * @param config - retrieval and byte limits; its admission mode is recorded with selector decisions.
  * @param selectorOf - Reads the optional Jev selector at request time. Without one, only candidates that share a
  * query term are injected.
  * @param pendingOf - Admissions the read waits for, so records from a just-completed compaction are visible.
@@ -177,13 +214,28 @@ export function installContinuumMemoryControllerContext(
     const ticket = controller.beginRead(principalOf(agent))
     if (ticket === undefined) return decision
     const selector = selectorOf()
-    // A selector sees the larger pool and may route by tag; the byte budget applies to the recall it selects.
-    const workingSet = controller.read(ticket, selector === undefined ? config : {
+    const traced = config.trace === true
+    const requestedLimits = selector === undefined ? config : {
       ...config, maxCandidates: config.maxPool ?? config.maxCandidates, maxTotalBytes: Number.MAX_SAFE_INTEGER,
-    }, query)
+    }
+    const outcome = traced ? controller.readWithReport(ticket, requestedLimits, query) : undefined
+    const workingSet = outcome?.workingSet ?? controller.read(ticket, requestedLimits, query)
     if (workingSet === undefined || !controller.isCurrent(ticket) || workingSet.candidates.length === 0) return decision
+    const recorder = traced && outcome !== undefined ? retrievalRecorder(ctx, agent) : undefined
     if (selector === undefined) {
       const matched = renderMemoryWorkingSet(workingSet.query, workingSet.candidates.filter(candidate => candidate.score > 0))
+      if (recorder !== undefined && outcome !== undefined) {
+        recordMemoryRetrieval(recorder, {
+          query, limits: retrievalLimits(config), selectorMounted: false, report: outcome.report,
+          ...(matched.candidates.length === 0 ? {} : {
+            injection: {
+              workingSet: matched,
+              dropped: workingSet.candidates.filter(candidate => candidate.score === 0)
+                .map(candidate => ({ id: candidate.id, reason: 'no-query-match' as const })),
+            },
+          }),
+        })
+      }
       return matched.candidates.length === 0 ? decision : { ...decision, messages: [...decision.messages, recallMessage(matched)] }
     }
     const selection = await selector.select(agent, {
@@ -196,6 +248,14 @@ export function installContinuumMemoryControllerContext(
         score: candidate.score,
         tags: tagsOf(agent, candidate.id),
       })),
+      limits: {
+        maxCandidates: config.maxCandidates,
+        maxExcerptBytes: config.maxExcerptBytes,
+        maxTotalBytes: config.maxTotalBytes,
+        candidatePool: config.candidatePool ?? 'lexical',
+        maxPool: config.maxPool ?? config.maxCandidates,
+        admission: config.admission ?? 'explicit',
+      },
     }, signal)
     signal.throwIfAborted()
     if (!isActive() || !controller.isCurrent(ticket)) return decision
@@ -204,15 +264,44 @@ export function installContinuumMemoryControllerContext(
       const candidate = byId.get(id)
       return candidate === undefined ? [] : [candidate]
     })
-    const filtered = budgetMemoryWorkingSet(workingSet.query, candidates, config.maxTotalBytes)
-    if (filtered.candidates.length === 0) return decision
-    return { ...decision, messages: [...decision.messages, recallMessage(filtered)] }
+    const budgeted = budgetMemoryWorkingSetWithDrops(workingSet.query, candidates, config.maxTotalBytes)
+    if (recorder !== undefined && outcome !== undefined) {
+      recordMemoryRetrieval(recorder, {
+        query, limits: retrievalLimits(config), selectorMounted: true, report: outcome.report,
+        injection: {
+          workingSet: budgeted.workingSet,
+          dropped: budgeted.dropped,
+          selection: {
+            mode: selection.mode, outcome: selection.outcome,
+            selectedIds: [...selection.selectedIds].slice(0, MAX_RECORDED_RECORDS),
+            baselineIds: [...selection.baselineIds].slice(0, MAX_RECORDED_RECORDS),
+          },
+        },
+      })
+    }
+    if (budgeted.workingSet.candidates.length === 0) return decision
+    return { ...decision, messages: [...decision.messages, recallMessage(budgeted.workingSet)] }
   })
   const dispose = ctx.effect(() => () => {
     active = false
     stop()
   })
   return () => { void dispose() }
+}
+
+/** Session log and warning sink for one read's retrieval events. */
+function retrievalRecorder(ctx: Context, agent: Agent): MemoryRetrievalRecorder {
+  return { session: agent.session, warn: message => ctx.logger.warn(message) }
+}
+
+/** Limits applied to the bounded recall, including the selector pool when one is mounted. */
+function retrievalLimits(config: ContinuumMemoryContextConfig): MemoryRetrievalLimits {
+  return {
+    maxCandidates: config.maxCandidates,
+    maxExcerptBytes: config.maxExcerptBytes,
+    maxTotalBytes: config.maxTotalBytes,
+    maxPool: config.maxPool ?? config.maxCandidates,
+  }
 }
 
 /** Wait for a promise that never rejects, or reject with the turn's cancellation. */

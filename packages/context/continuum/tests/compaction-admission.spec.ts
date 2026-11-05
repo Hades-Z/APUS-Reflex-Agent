@@ -144,6 +144,9 @@ describe('Continuum compaction admission', () => {
     const admitted = records(h.agent)
     expect(admitted).toHaveLength(1)
     expect(admitted[0]).not.toHaveProperty('content')
+    const indexEvent = h.agent.session.snapshotEvents().find(event => event.type === 'continuum/memory-index')
+    expect(indexEvent?.type === 'continuum/memory-index' ? indexEvent.data.admission : undefined)
+      .toEqual({ source: 'compaction', tagSource: 'reflex' })
     expect(sourceText(h.agent, admitted[0]!)).toContain('X-Orbit-Key')
     const source = h.agent.session.snapshotEvents().find(event => event.type === 'user/message' && event.data.source.kind === 'user')
     expect(admitted[0]).toEqual({
@@ -169,6 +172,9 @@ describe('Continuum compaction admission', () => {
     h.agent.followup(user('Next request.'))
     await h.agent.whenIdle()
     expect(records(h.agent).length).toBeGreaterThan(1)
+    expect(h.agent.session.snapshotEvents().flatMap(event =>
+      event.type === 'continuum/memory-index' ? [event.data.admission?.tagSource] : [])
+      .every(source => source === 'fallback-untagged')).toBe(true)
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('admitting every compacted message'))
   })
 

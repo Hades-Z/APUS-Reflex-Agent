@@ -61,3 +61,6 @@ __pycache__/
 /frontend/tasks/
 /frontend/docs/feat-system3-integration/packaging-preflight.json
 /frontend/docs/feat-system3-integration/ci-recovery-plan.md
+
+# Local runtime state, never part of the product.
+.dsh-home/

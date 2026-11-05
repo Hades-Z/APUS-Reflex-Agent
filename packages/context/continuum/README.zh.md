@@ -38,7 +38,7 @@ Session 事件使用现有 persistence backend；完成 `ctx.sessions.flush(sess
 
 可选插件 `@deepseek-ai/dsh-continuum/tasks` 将不同 Session 接入宿主配置的同一任务。独立 JSONL 日志提供单写者、持久版本检查、精确请求去重和完整原文；内部日志不进入普通会话列表。配置固定 `root`、`workspace`、`domainId`、`principalId` 和 `taskId`；`maxContextBytes` 与 `maxPageBytes` 默认都是 8192。宿主向一个本地主体授权精确 canonical 工作区；这不是多用户认证服务。
 
-人类文本不 trim、不按数量淘汰、不按长度截断。live 来源通过所属 Session flush；cold 来源先临时取得独占写权限，再 flush 与精确回读。其他进程持写的来源拒绝确认。域操作在 append、flush 和精确回读后才发布；持久状态不确定时停止后续读写，等待恢复。任务修改与模型请求串行，租约覆盖下游中间件直到流结束，因此运行中的请求会延后纠正和其他输入准入。辅助压缩请求保留授权与停用检查，使用各自选定的消息区间。
+人类文本不 trim、不按数量淘汰、不按长度截断。live 来源通过所属 Session flush；cold 来源先临时取得独占写权限，再 flush 与精确回读。其他进程持写的来源拒绝确认。域操作在 append、flush 和精确回读后才发布；持久状态不确定时停止后续读写，等待恢复。每次提交后，业务 Session 追加一条 log-only 的 `continuum/task-receipt` 回执，记录 journal id、任务、请求、已提交 revision 和 canonical 工作区；隔离 journal 仍是唯一权威，回执不参与恢复、授权、投影或调度。首次 `continuum/task-binding` 还记录当时的 journal revision 以及参与 `retirementDigest` 计算的已停用条目，因此无需重算即可读取停用来源。任务修改与模型请求串行，租约覆盖下游中间件直到流结束，因此运行中的请求会延后纠正和其他输入准入。辅助压缩请求保留授权与停用检查，使用各自选定的消息区间。
 
 `read_continuum_task` 返回严格字节预算的 JSON 页，包含来源事件与文本块、SHA-256、任务版本和续页游标；游标过期时从当前首页重新读取。`pending` 仅表示还有有效原文未读取，读取或保存都不等于处理完成。上下文快照对应其装配版本，当前人类消息在模型派发前保存，可能推进该版本。宿主显式纠正会停用指定前驱，同时保留旧原文。正式 profile 常驻轻量任务检查：已绑定的 Session 缺少匹配任务服务时拒绝模型派发。已有绑定 Session 在停用后也拒绝继续派发模型请求，避免沿用旧摘要或输出；新 Session 使用当前任务。自动修复旧历史、assistant/tool 进度收录、输入处理回执、对此任务投影的 Reflex 排序及实际窗口规模验收仍需分别完成。
 
@@ -49,7 +49,7 @@ Session 事件使用现有 persistence backend；完成 `ctx.sessions.flush(sess
 <a id="understand-the-implementation"></a>
 ## 理解实现
 
-`MemoryRecordStore` 要求调用方提供已观察到的 revision，并返回不可变快照。`ContinuumMemory` 在每个 Agent 的同一所属投影中保存 controller 和记录 store，从 Agent Session 恢复该投影，并把显式的 create/supersede/deactivate 调用持久化为 `continuum/memory-record`。在 `user-message` 准入模式下，已提交的人类 `user/message` 会在 Session append 完成后转换为记录；生成的 recall 消息和其他来源会被忽略。服务在 Agent 创建后挂载时，仅使用属于同一 Session 的当前发起操作的 Agent；没有所属 Agent 的输入及其他 Session 的输入不会被准入。在 `compaction` 准入模式下，每个已提交的 `compaction/summary` 会把它遮蔽的、有文本且尚无记录的人类消息加入队列；可选的 `continuumMemoryAdmitter` 返回要索引的 ID 及其标签，admitter 失败时把全部候选以无标签方式索引，admitter 在运行前被移除时一条都不索引。每条保留的原话成为一个 `continuum/memory-index` 事件：一条 L1 索引项，只含标签和指向来源事件的指针，从不含原文。折叠日志时从该来源事件解析原文，放入内存中的记录 store，因此检索读取的是原文，而日志中只有一份副本。没有挂载 admitter 时，此模式既不准入也不召回。下一次同 step 读取会等待排队中的准入，因此请求之前发生的压缩所产生的记录对该请求可见。controller 会在提交变更后维护可丢弃的派生索引，索引候选保留与直接检索相同的词法子串匹配；折叠事件不会调用模型，也不会创建第二套持久化事实源。
+`MemoryRecordStore` 要求调用方提供已观察到的 revision，并返回不可变快照。`ContinuumMemory` 在每个 Agent 的同一所属投影中保存 controller 和记录 store，从 Agent Session 恢复该投影，并把显式的 create/supersede/deactivate 调用持久化为 `continuum/memory-record`。supersede 或 deactivate 事件同时携带被替换记录的快照，并标记在途读取已失效。在 `user-message` 准入模式下，已提交的人类 `user/message` 会在 Session append 完成后转换为记录；生成的 recall 消息和其他来源会被忽略。服务在 Agent 创建后挂载时，仅使用属于同一 Session 的当前发起操作的 Agent；没有所属 Agent 的输入及其他 Session 的输入不会被准入。在 `compaction` 准入模式下，每个已提交的 `compaction/summary` 会把它遮蔽的、有文本且尚无记录的人类消息加入队列；可选的 `continuumMemoryAdmitter` 返回要索引的 ID 及其标签，admitter 失败时把全部候选以无标签方式索引，admitter 在运行前被移除时一条都不索引。每条保留的原话成为一个 `continuum/memory-index` 事件：一条 L1 索引项，只含标签和指向来源事件的指针，从不含原文。事件还记录准入路径，以及标签来自 Reflex 还是 admitter 失败后的无标签保留。折叠日志时从该来源事件解析原文，放入内存中的记录 store，因此检索读取的是原文，而日志中只有一份副本。没有挂载 admitter 时，此模式既不准入也不召回。下一次同 step 读取会等待排队中的准入，因此请求之前发生的压缩所产生的记录对该请求可见。controller 会在提交变更后维护可丢弃的派生索引，索引候选保留与直接检索相同的词法子串匹配；折叠事件不会调用模型，也不会创建第二套持久化事实源。
 
 -----
 
@@ -63,7 +63,7 @@ Session 事件使用现有 persistence backend；完成 `ctx.sessions.flush(sess
 <a id="lifecycle-and-evaluation"></a>
 ## 生命周期与评测
 
-`ContinuumMemoryController` 负责 Reflex 专属开关、精确作用域授权和在途读取的 generation token。已提交的启用状态或模式变更会使待处理投影失效，包括关闭后重新开启的情况。Jev 服务卸载也会使在途读取失效，即使选择返回前已重新挂载；其他 Cordis 隔离域内的 Jev 绑定变化不会使本服务的读取失效。作用域变更会重新挂载服务，并使之前的投影失效。释放任一上下文 consumer 或其所属 Context 后，待完成的 pre-step hook 与 selector 结果均不能注入召回。Agent 释放时移除其控制器；服务释放时使全部控制器失效并解除引用。被拒绝的配置编辑不会影响当前投影。这些变更会保留持久记录；停用记录同样会使待处理投影失效。未接入 Reflex 时，`resolveContinuumMemorySwitch` 回到原版路径。挂载配套 selector 后，active 模式通过 Jev 对完整有界工作集排序并写入 `continuum/memory-decision`；shadow 模式调用 Jev 但保留 baseline 顺序。consumer 保留 selector 顺序、去重 ID、忽略未知 ID，并提供生命周期检查，阻止持久化屏障期间失效的请求继续外发。`summary` 从当前由 Session 支持的记录投影构建可丢弃的授权导航视图，`zoom` 返回节点的精确来源引用；两者都不创建第二套事实日志。`buildContinuumSummaryTree` 提供确定性的 scope/kind 导航，`measureContinuumStableCacheLayouts` 报告本地稳定前缀复用。本地摘要树/缓存实验生成在 `docs/feat-continuum-memory/continuum-ablation.json`，分别测量检索覆盖率与布局复用，不声称 provider 账单或服务端缓存命中。
+`ContinuumMemoryController` 负责 Reflex 专属开关、精确作用域授权和在途读取的 generation token。已提交的启用状态或模式变更会使待处理投影失效，包括关闭后重新开启的情况。Jev 服务卸载也会使在途读取失效，即使选择返回前已重新挂载；其他 Cordis 隔离域内的 Jev 绑定变化不会使本服务的读取失效。作用域变更会重新挂载服务，并使之前的投影失效。释放任一上下文 consumer 或其所属 Context 后，待完成的 pre-step hook 与 selector 结果均不能注入召回。Agent 释放时移除其控制器；服务释放时使全部控制器失效并解除引用。被拒绝的配置编辑不会影响当前投影。这些变更会保留持久记录；停用记录同样会使待处理投影失效。未接入 Reflex 时，`resolveContinuumMemorySwitch` 回到原版路径。挂载配套 selector 后，active 模式通过 Jev 对完整有界工作集排序并写入 `continuum/memory-decision`；回执记录生效的选择策略，调用方提供时同时记录检索上限和准入模式；shadow 模式调用 Jev 但保留 baseline 顺序。consumer 保留 selector 顺序、去重 ID、忽略未知 ID，并提供生命周期检查，阻止持久化屏障期间失效的请求继续外发。`summary` 从当前由 Session 支持的记录投影构建可丢弃的授权导航视图，`zoom` 返回节点的精确来源引用；两者都不创建第二套事实日志。`buildContinuumSummaryTree` 提供确定性的 scope/kind 导航，`measureContinuumStableCacheLayouts` 报告本地稳定前缀复用。本地摘要树/缓存实验生成在 `docs/feat-continuum-memory/continuum-ablation.json`，分别测量检索覆盖率与布局复用，不声称 provider 账单或服务端缓存命中。
 
 <a id="model-experience"></a>
 ## Model Experience

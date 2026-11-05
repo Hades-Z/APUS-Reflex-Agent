@@ -55,6 +55,23 @@ describe('Continuum automatic admission', () => {
     expect(created?.type === 'continuum/memory-record' ? created.data.record.sourceRefs[0]?.eventSeq : undefined).toBe(
       h.agent.session.snapshotEvents().find(event => event.type === 'user/message')?.seq,
     )
+    // The write is two facts: the record was stored, and the same message
+    // became findable. Without the index entry a record exists but retrieval
+    // has no pointer to it.
+    const indexed = h.agent.session.snapshotEvents().find(event => event.type === 'continuum/memory-index')
+    expect(indexed).toMatchObject({
+      data: {
+        entry: {
+          scope: 'workspace',
+          tags: [],
+          source: {
+            sessionId: h.agent.session.id,
+            eventSeq: h.agent.session.snapshotEvents().find(event => event.type === 'user/message')?.seq,
+          },
+        },
+        admission: { source: 'user-message', tagSource: 'unjudged' },
+      },
+    })
 
     h.agent.followup(user('What day is the migration cutover?'))
     await h.agent.whenIdle()

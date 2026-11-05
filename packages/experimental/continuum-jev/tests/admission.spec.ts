@@ -256,6 +256,23 @@ describe('Continuum threshold selection', () => {
     expect(result.selectedIds).toEqual(['lexical'])
     expect(result.evaluation.unscoredIds).toEqual(['lexical', 'other'])
   })
+
+  it('records the effective selection policy and caller limits in every evaluation', async () => {
+    const limits = {
+      maxCandidates: 8, maxExcerptBytes: 2048, maxTotalBytes: 8192,
+      candidatePool: 'all', maxPool: 8, admission: 'compaction',
+    } as const
+    const result = await selectContinuumMemory(fake([0.9]),
+      { ...threshold, minRelevance: 0.8, routeAbove: 3, minRouteProbability: 0.6 },
+      { query: 'q', candidates: [candidate('a', 0, 'fact')], limits })
+    expect(result.evaluation).toMatchObject({
+      policy: { selection: 'threshold', minRelevance: 0.8, routeAbove: 3, minRouteProbability: 0.6 }, limits,
+    })
+    const prepared: unknown[] = []
+    await selectContinuumMemory(fake([0.9]), { ...threshold, minRelevance: 0.8 }, { query: 'q', candidates: [candidate('a', 0)], limits },
+      undefined, (receipt) => { prepared.push(receipt.evaluation); return Promise.resolve(SessionSeq(prepared.length)) })
+    expect(prepared[0]).toMatchObject({ phase: 'prepared', policy: { selection: 'threshold', minRelevance: 0.8 }, limits })
+  })
 })
 
 describe('Continuum Reflex admitter service', () => {
@@ -333,6 +350,8 @@ describe('Continuum Reflex admitter service', () => {
     const receipts = session.snapshotEvents().flatMap(event => event.type === 'continuum/memory-admission' ? [event] : [])
     expect(receipts.map(event => event.data.phase)).toEqual(['prepared', 'settled', 'prepared', 'settled'])
     expect(receipts[1]?.data.preparedSeq).toBe(receipts[0]?.seq)
+    expect(receipts.map(event => [event.data.batchIndex, event.data.batchSize, event.data.batchTotal]))
+      .toEqual([[0, 2, 3], [0, 2, 3], [1, 1, 3], [1, 1, 3]])
   })
 
   it('admits everything after a durable prepared receipt when the provider then fails', async () => {

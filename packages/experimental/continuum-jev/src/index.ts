@@ -19,6 +19,28 @@ export type ContinuumJevMode = 'off' | 'shadow' | 'active'
  */
 export type ContinuumJevSelection = 'rank' | 'threshold'
 
+/** Effective selection knobs recorded with one relevance decision. */
+export interface ContinuumMemoryDecisionPolicy {
+  readonly selection: ContinuumJevSelection
+  /** Relevance floor for `threshold`; unused by `rank`. */
+  readonly minRelevance: number
+  /** Candidate count above which `threshold` routes by tag; unused by `rank`. */
+  readonly routeAbove: number
+  /** Routing probability floor for `threshold`; unused by `rank`. */
+  readonly minRouteProbability: number
+}
+
+/** Retrieval limits and admission mode the caller applied before offering candidates. */
+export interface MemorySelectionLimits {
+  readonly maxCandidates: number
+  readonly maxExcerptBytes: number
+  readonly maxTotalBytes: number
+  readonly candidatePool: 'lexical' | 'all'
+  /** Candidate pool offered to the selector; equal to `maxCandidates` when unset. */
+  readonly maxPool: number
+  readonly admission: 'explicit' | 'user-message' | 'compaction'
+}
+
 /** Candidate supplied by a bounded, authorized local retrieval step. */
 export interface MemorySelectionCandidate {
   readonly id: MemoryId
@@ -35,6 +57,8 @@ export interface MemorySelectionRequest {
   readonly candidates: readonly MemorySelectionCandidate[]
   /** Synchronous lifecycle check; false prevents dispatch after any awaited checkpoint. */
   readonly isCurrent?: () => boolean
+  /** Caller-applied limits and admission mode; recorded in the evaluation when supplied. */
+  readonly limits?: MemorySelectionLimits
 }
 
 /** Resolved settings for a bounded relevance batch; privacy admission precedes network dispatch. */
@@ -128,6 +152,10 @@ export interface ContinuumMemoryEvaluation {
     | 'persistence-unavailable' | 'invalidated'
   /** Tag routing that preceded relevance; absent when the candidates did not exceed `routeAbove`. */
   readonly routing?: ContinuumMemoryRouting
+  /** Effective selection policy; absent on historical receipts. */
+  readonly policy?: ContinuumMemoryDecisionPolicy
+  /** Caller-applied retrieval limits and admission mode; absent when the caller supplied none. */
+  readonly limits?: MemorySelectionLimits
 }
 
 /** One tag-routing judgement: which L1 tags the input needs. */
@@ -205,6 +233,12 @@ export interface ContinuumMemoryAdmissionReceipt {
   readonly version: 1
   readonly mode: ContinuumJevMode
   readonly phase: 'prepared' | 'settled'
+  /** Zero-based position of this batch within one caller admission; absent when the caller did not split. */
+  readonly batchIndex?: number
+  /** Candidates in this batch. */
+  readonly batchSize?: number
+  /** Candidates offered to the whole caller admission. */
+  readonly batchTotal?: number
   /** Prepared receipt position, when a durable profile owns the dispatch. */
   readonly preparedSeq?: SessionSeq
   /** Compacted human messages judged in this batch, in Session order. */
@@ -282,6 +316,7 @@ class ContinuumJevPlugin extends Service {
           query: input.query,
           isCurrent: () => active && input.isCurrent(),
           candidates: input.candidates.map(candidate => ({ ...candidate, id: MemoryId(candidate.id) })),
+          ...(input.limits === undefined ? {} : { limits: input.limits }),
         }, signal, prepared => durable(recordContinuumMemoryDecision(agent.session, prepared)))
         signal.throwIfAborted()
         recordContinuumMemoryDecision(agent.session, result)
@@ -296,14 +331,17 @@ class ContinuumJevPlugin extends Service {
           const durable = checkpoint(agent, signal)
           const admitted: ContinuumAdmittedMemory[] = []
           const size = admissionBatchSize(config)
+          let batchIndex = 0
           for (let start = 0; start < input.candidates.length; start += size) {
+            const batch = input.candidates.slice(start, start + size)
+            const batchFacts = { batchIndex, batchSize: batch.length, batchTotal: input.candidates.length }
+            batchIndex += 1
             const result = await admitContinuumMemory(ctx.get('jev'), config, {
               isCurrent: () => active && input.isCurrent(),
-              candidates: input.candidates.slice(start, start + size)
-                .map(candidate => ({ id: MemoryId(candidate.id), content: candidate.content })),
-            }, signal, prepared => durable(agent.session.append('continuum/memory-admission', prepared)))
+              candidates: batch.map(candidate => ({ id: MemoryId(candidate.id), content: candidate.content })),
+            }, signal, prepared => durable(agent.session.append('continuum/memory-admission', { ...prepared, ...batchFacts })))
             signal.throwIfAborted()
-            agent.session.append('continuum/memory-admission', result)
+            agent.session.append('continuum/memory-admission', { ...result, ...batchFacts })
             // admittedTags is aligned with admittedIds by construction.
             admitted.push(...result.admittedIds.map((id, index) => ({
               id: String(id), tags: result.admittedTags[index] as readonly string[],
@@ -432,6 +470,11 @@ export async function selectContinuumMemory(
   assertConfig(config)
   signal?.throwIfAborted()
   const threshold = config.selection === 'threshold'
+  const policy: ContinuumMemoryDecisionPolicy = {
+    selection: config.selection ?? 'rank', minRelevance: config.minRelevance ?? 0.7,
+    routeAbove: config.routeAbove ?? MAX_JEV_QUESTIONS, minRouteProbability: config.minRouteProbability ?? 0.5,
+  }
+  const recorded = input.limits === undefined ? { policy } : { policy, limits: input.limits }
   const baseline = input.candidates.map(candidate => candidate.id)
   const matched = input.candidates.filter(candidate => !threshold || candidate.score > 0).map(candidate => candidate.id)
   let routing: ContinuumMemoryRouting | undefined
@@ -444,7 +487,7 @@ export async function selectContinuumMemory(
     ...(failure === undefined ? {} : { failure }),
     evaluation: { version: 1, strategy: 'batch-relevance', phase: reason === 'prepared' ? 'prepared' : 'settled',
       ...(preparedSeq === undefined ? {} : { preparedSeq }), request, rankedIds: baseline, unscoredIds: baseline, reason,
-      ...(routing === undefined ? {} : { routing }) },
+      ...recorded, ...(routing === undefined ? {} : { routing }) },
   })
   if (config.mode === 'off') return fallback('off')
   if (baseline.length === 0) return fallback('empty')
@@ -480,7 +523,7 @@ export async function selectContinuumMemory(
       return {
         mode: config.mode, selectedIds: config.mode === 'active' ? [] : matched, baselineIds: baseline, outcome: 'jev',
         evaluation: { version: 1, strategy: 'batch-relevance', phase: 'settled', request: null, rankedIds: baseline, unscoredIds: baseline,
-          reason: 'ranked', routing },
+          reason: 'ranked', ...recorded, routing },
       }
     }
     pool = input.candidates.filter(candidate => candidate.tags.length === 0 || candidate.tags.some(tag => picked.includes(tag)))
@@ -516,7 +559,7 @@ export async function selectContinuumMemory(
     mode: config.mode, selectedIds: config.mode === 'active' ? selected : matched, baselineIds: baseline, outcome: 'jev',
     evaluation: { version: 1, strategy: 'batch-relevance', phase: 'settled',
       ...(preparedSeq === undefined ? {} : { preparedSeq }), request: batch.request, response: batch.response, rankedIds,
-      unscoredIds: unscored, reason: 'ranked', ...(routing === undefined ? {} : { routing }) },
+      unscoredIds: unscored, reason: 'ranked', ...recorded, ...(routing === undefined ? {} : { routing }) },
   }
 }
 

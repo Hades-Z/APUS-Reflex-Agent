@@ -141,7 +141,7 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
       const principal = { scopes: [...config.scopes] }
       const retrievalConfig = {
         maxCandidates: config.maxCandidates, maxExcerptBytes: config.maxExcerptBytes, maxTotalBytes: config.maxTotalBytes,
-        candidatePool: config.candidatePool, maxPool: config.maxPool,
+        candidatePool: config.candidatePool, maxPool: config.maxPool, admission: config.admission ?? 'explicit',
       }
       installContinuumMemoryControllerContext(ctx, agent => this.reflexReady() ? this.projectionFor(agent, {
         enabled: readSetting(config.enabled), mode: readSetting(config.mode), reflexMounted: ctx.get('jev') !== undefined,
@@ -186,20 +186,23 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
     const store = this.storeFor(agent)
     const created = store.create(record)
     appendMemoryRecordEvent(agent.session, 'create', created)
-    this.controller(agent).observe(created)
+    this.controller(agent).observe(created, agent.session)
     return created
   }
 
   supersede(agent: Agent, id: MemoryId, expectedRevision: number, replacement: NewMemoryRecord): MemoryRecord {
-    const next = this.storeFor(agent).supersede(id, expectedRevision, replacement)
-    appendMemoryRecordEvent(agent.session, 'supersede', next)
+    const store = this.storeFor(agent)
+    const previous = store.get(id)
+    const next = store.supersede(id, expectedRevision, replacement)
+    appendMemoryRecordEvent(agent.session, 'supersede', next, previous)
     this.controller(agent).supersede(next)
     return next
   }
 
   deactivate(agent: Agent, id: MemoryId, expectedRevision: number): MemoryRecord {
+    const previous = this.storeFor(agent).get(id)
     const next = this.controller(agent).deactivate(id, expectedRevision)
-    appendMemoryRecordEvent(agent.session, 'deactivate', next)
+    appendMemoryRecordEvent(agent.session, 'deactivate', next, previous)
     return next
   }
 
@@ -265,7 +268,8 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
         return content.length === 0 || store.get(createMemoryId(id)) !== undefined ? [] : [{ id, content, seq: source.seq }]
       })
     if (candidates.length === 0) return
-    const admitted = new Map((await this.admitted(agent, candidates, signal)).map(memory => [memory.id, memory.tags]))
+    const judged = await this.admitted(agent, candidates, signal)
+    const admitted = new Map(judged.admitted.map(memory => [memory.id, memory.tags]))
     if (!this.state().enabled) return
     for (const candidate of candidates) {
       const id = createMemoryId(candidate.id)
@@ -273,9 +277,15 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
       if (tags === undefined || store.get(id) !== undefined) continue
       const source = { sessionId: agent.session.id, eventSeq: candidate.seq }
       // The L1 index keeps only tags and the pointer; the in-memory record caches the L2 text for retrieval.
-      appendMemoryIndexEvent(agent.session, { id, scope, tags: [...tags], source })
+      // It goes first: `foldMemoryRecordEvents` rebuilds a record from its index
+      // entry, so the index must be the event that introduces the id.
+      appendMemoryIndexEvent(agent.session, { id, scope, tags: [...tags], source },
+        { source: 'compaction', tagSource: judged.tagSource })
       projection.tags.set(id, tags)
-      this.controller(agent).observe(store.create({ id, kind: 'fact', scope, content: candidate.content, sourceRefs: [source] }))
+      this.controller(agent).observe(
+        store.create({ id, kind: 'fact', scope, content: candidate.content, sourceRefs: [source] }),
+        agent.session,
+      )
     }
   }
 
@@ -287,21 +297,21 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
   /** Candidates the mounted admitter keeps, with tags; every candidate untagged when it fails, none when it was removed. */
   private async admitted(
     agent: Agent, candidates: readonly ContinuumAdmissionCandidate[], signal: AbortSignal,
-  ): Promise<readonly ContinuumAdmittedMemory[]> {
+  ): Promise<{ readonly admitted: readonly ContinuumAdmittedMemory[]; readonly tagSource: 'reflex' | 'fallback-untagged' | 'unjudged' }> {
     const all = candidates.map(candidate => ({ id: candidate.id, tags: [] }))
     const admitter = this.ctx.get('continuumMemoryAdmitter')
-    if (admitter === undefined) return []
+    if (admitter === undefined) return { admitted: [], tagSource: 'unjudged' }
     try {
       const admission = await admitter.admit(agent, {
         candidates: candidates.map(({ id, content }) => ({ id, content })),
         isCurrent: () => !signal.aborted && this.state().enabled,
       }, signal)
-      return admission.admitted
+      return { admitted: admission.admitted, tagSource: 'reflex' }
     } catch (error: unknown) {
       signal.throwIfAborted()
       // Losing a compacted message is worse than keeping one that is not needed.
       this.ctx.logger.warn(`continuum admitter failed; admitting every compacted message: ${String(error)}`)
-      return all
+      return { admitted: all, tagSource: 'fallback-untagged' }
     } finally {
       signal.throwIfAborted()
     }
@@ -325,6 +335,15 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
       content,
       sourceRefs: [{ sessionId: session.id, eventSeq: event.seq }],
     })
+    // The record says the content was stored; the index says it became
+    // findable. `user-message` admission runs no tag judgement, so the entry is
+    // written untagged rather than borrowing the compaction path's tags.
+    appendMemoryIndexEvent(session, {
+      id,
+      scope,
+      tags: [],
+      source: { sessionId: session.id, eventSeq: event.seq },
+    }, { source: 'user-message', tagSource: 'unjudged' })
   }
 }
 

@@ -93,6 +93,8 @@ This section explains the design decisions behind the seam and where the code re
 
 Registration and disposal run through `ctx.effect()`, so provider routes live and die with the registering fiber. `finalExtension()` splits on both path separators and returns `''` for names without an extension or leading-dot dotfiles, which no route matches. `LspError` extends `HarnessError` with stable codes (`LSP_INVALID_PROVIDER`, `LSP_CONFLICT`, `LSP_UNAVAILABLE`, `LSP_DISPOSED`, `LSP_UNSUPPORTED_OPERATION`, `LSP_MALFORMED_RESPONSE`) that callers route on instead of parsing `message`.
 
+Each `query()` that selects a provider appends a log-only `lsp/provider-selected` event to the initiating Agent's session. It records the operation, the provider id that ran, the language id derived from its extension mapping, the extension-based selection mode, the selection and operation timings, the outcome, and an empty seam-level fallback chain — the seam never falls back, and provider-internal retries are not visible here. A query without an initiating Agent, or a failed append, leaves the query's result or error unchanged.
+
 </details>
 
 -----
