@@ -10,9 +10,14 @@ FROM python:3.12-slim AS base
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     NEXT_TELEMETRY_DISABLED=1
+# bubblewrap is required, not optional: the sandbox plugin runs every tool
+# command under `workspace-write` confinement and refuses to run unconfined
+# when no backend exists. Without it the harness accepts a run and then fails
+# every command it tries to execute.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl git ripgrep build-essential make g++ xz-utils \
+      bubblewrap \
  && rm -rf /var/lib/apt/lists/*
 # Node comes from the official tarball rather than a second base image so the
 # Python interpreter stays the one this image's package manager owns.
