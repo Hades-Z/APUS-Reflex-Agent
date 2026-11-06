@@ -93,6 +93,12 @@ export interface Config {
    * with the question count, so parallel groups answer sooner. Omission sends every decision as one request.
    */
   readonly questionsPerRequest?: number
+  /**
+   * Chat-template switches for the chat-completions dialect, sent verbatim as `chat_template_kwargs`. A reasoning
+   * model that thinks before answering spends its budget before reaching the verdict; a deployment whose model can be
+   * told to answer directly disables that here. Omission sends no switches.
+   */
+  readonly chatTemplateKwargs?: Volatile<Readonly<Record<string, string | number | boolean>> | undefined>
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -123,6 +129,7 @@ export default class Jev extends TypertRemoteService {
     http2: z.boolean().default(false),
     resetAfterFailures: z.number().step(1).min(1),
     questionsPerRequest: z.number().step(1).min(1).max(MAX_JEV_QUESTIONS),
+    chatTemplateKwargs: z.dict(z.union([z.string(), z.number(), z.boolean()])).volatile(),
   })
 
   private readonly providers = new Map<string, JevProvider>()
@@ -156,11 +163,13 @@ export default class Jev extends TypertRemoteService {
       const identity = providerIdentity(config)
       if (identity === undefined) return undefined
       const apiKeyEnv = config.apiKeyEnv.get()
+      const chatTemplateKwargs = config.chatTemplateKwargs?.get()
       return new SystemOneProvider({
         id: providerId,
         ...fetcher === undefined ? {} : { fetcher },
         ...identity, protocol: config.protocol.get(),
         effort: config.effort.get(), timeoutMs: config.timeoutMs.get(),
+        ...chatTemplateKwargs === undefined ? {} : { chatTemplateKwargs },
         ...apiKeyEnv === undefined ? {} : { apiKeyEnv, resolveApiKey: () => resolveJevApiKey(ctx, apiKeyEnv) },
       })
     }
