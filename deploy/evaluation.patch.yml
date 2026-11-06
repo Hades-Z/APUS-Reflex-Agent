@@ -47,16 +47,68 @@
 
     # Continuum's two halves: the memory service and the Jev bridge that
     # admits and indexes what the service writes.
+    #
+    # Only `continuum-memory` is inserted: the sdk profile does not mount it.
+    # `continuum-jev` and `system3` are already mounted there, and `insert`
+    # silently ignores an id that exists — their configuration is applied by
+    # the top-level rows at the end of this file instead.
     - id: continuum-memory
       name: /workspace/packages/context/continuum/lib/index.js
       config:
         enabled: !!js 'process.env.CONTINUUM_MEMORY_ENABLED !== "false"'
         mode: !!js 'process.env.CONTINUUM_MEMORY_MODE || "active"'
+        # The service default is `explicit`, which stores only what a caller
+        # writes by name. The evaluation agent never writes memory explicitly,
+        # so the store stays empty and each question is answered from the whole
+        # conversation in one prompt — a long-context run, not a memory run.
+        # `user-message` is the mode memory benchmarks assume: every committed
+        # user message becomes a record the retrieval side can return.
+        admission: !!js 'process.env.CONTINUUM_MEMORY_ADMISSION || "user-message"'
 
-    - id: continuum-jev
-      name: /workspace/packages/experimental/continuum-jev/lib/index.js
+# The rows below already exist in the sdk profile. A top-level entry merges into
+# that row; an `insert` of the same id is dropped without a word, which is how
+# the memory bridge and System3 ran with their defaults instead of this
+# deployment's settings.
+- id: continuum-jev
+  config:
+    # The bridge defaults to `off`, which ranks every recall from the lexical
+    # baseline and never asks Jev. `active` lets its judgement decide which
+    # records the model sees.
+    mode: !!js 'process.env.CONTINUUM_JEV_MODE || "active"'
+    timeoutMs: 180000
+    # Ranking sends candidate excerpts to Jev, which runs on another host.
+    # `local-only` refuses every network route before the other checks run;
+    # naming that route explicitly is what allows the call. The id is the
+    # provider's registry id (`system-one`), not the Loader row id `jev`.
+    privacyPolicy:
+      mode: cloud-approved
+      cloudApproval: true
+      approvedRemoteIds: [system-one]
+      approvedRemoteDataClasses: [workspace]
+    sessionDataClasses: [workspace]
 
-    # System3 routes an incoming request to a model before the step opens, and
-    # records the choice; without it the trace cannot say why this model.
-    - id: system3
-      name: /workspace/packages/experimental/system3/lib/index.js
+# System3 routes an incoming request to a model before the step opens, and
+# records the choice; without it the trace cannot say why this model.
+- id: system3
+  config:
+    # The service defaults to `local-only` with no approved route, which denies
+    # every outbound judgement before it is sent. The evaluation deployment's
+    # Jev is the gateway row above, so that route is approved here; `jevRouteId`
+    # is the Loader row id, not the provider id.
+    privacyMode: controlled
+    approvedRemoteIds: [system-one]
+    approvedRemoteDataClasses: [workspace]
+    jevRouteId: jev
+    jevExecutionDomain: network
+    # Every decision branch below defaults to `false`, which installs the
+    # service and then never judges. They are switched on so an evaluation
+    # trace records the decisions the harness actually took.
+    skillSelection:
+      sessionDataClasses: [workspace]
+      minConfidence: 0.5
+      # The evaluation prompt alone exceeds 16 KB; a smaller limit makes every
+      # decision `input-too-large` instead of a judgement.
+      maxInputBytes: 400000
+      maxContentBytes: 200000
+      maxCandidates: 15
+      deadlineMs: 3000
