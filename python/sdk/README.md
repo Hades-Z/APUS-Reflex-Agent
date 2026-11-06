@@ -30,6 +30,8 @@ with DeepSeekHarness(
 print(result.final_response)
 ```
 
+`DeepSeekHarness.cancel_session(session_id)` stops one session's active and queued work and returns only after the runtime confirmed that session stopped; the shared runtime and every other session keep running. A prompt already in flight when the cancel arrived is refused, so cancelled work never starts afterwards; a prompt sent after the call returns starts new work on the same session. A runtime refusal, failure, or timeout raises instead of returning. `HarnessClient.session_cancel(session_id)` is the same operation below the run API.
+
 `DeepSeekHarness` starts lazily and reuses its runtime until `close()` or context-manager exit. The initial profile handshake has an independent 30-second default bound through `initialize_timeout_seconds`; ordinary turns remain unbounded unless `request_timeout_seconds` is set. A timeout names the selected profile and includes retained runtime diagnostics. `cwd` is the agent workspace; `runtime_cwd` independently selects the subprocess working directory. Both become absolute before launch. `provider`, `model`, optional `reasoning_effort`, and optional positive `max_tokens` are sent during JSON-RPC initialization. `base_url` and `api_key` explicitly override `DEEPSEEK_BASE_URL` and `DEEPSEEK_API_KEY` in the child environment.
 
 ## Customize plugins
@@ -72,3 +74,5 @@ The selected home stores profiles, plugins, and every profile-owned durable reso
 For APUS Continuum replay, call `latest_continuum_memory_decision(result.events)` to read the newest recorded `continuum/memory-decision` receipt. The projection is local and replay-only: it never calls Jev or performs a new retrieval, and returns `None` when the log has no decision.
 
 See the [Python tutorial](../../docs/user/guide/python-sdk.md), [runnable example](examples/README.md), and [runtime wheel reference](../sdk-runtime/README.md).
+
+The HTTP service uses `DSH_REQUEST_TIMEOUT_SECONDS` (default 30, finite and positive) for control requests and cancellation acknowledgement. This does not limit model output tokens or the overall case runtime. A cancellation of an already completed run preserves and returns its completed status.

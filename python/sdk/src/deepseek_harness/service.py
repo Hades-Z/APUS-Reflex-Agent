@@ -16,6 +16,7 @@ platform choice this package does not otherwise make.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import uuid
@@ -36,7 +37,29 @@ class _Run:
     session_id: str
     result: dict[str, Any] | None = None
     error: str | None = None
+    # ``none`` → ``cancelling`` → ``cancelled`` | ``cancel-failed``. Only a
+    # confirmed stop may be published as ``cancelled``.
+    cancel_state: str = "none"
     done: threading.Event = field(default_factory=threading.Event)
+
+    @property
+    def cancel_requested(self) -> bool:
+        """Whether the run must withhold delivery and its own outcome."""
+        return self.cancel_state != "none"
+
+
+class _RunCancelled(Exception):
+    """Internal signal: the run was cancelled before its prompt was delivered."""
+
+
+def _refuse_when_cancelled(run: _Run) -> Callable[[], None]:
+    """Build the delivery-point check for one run's prompt."""
+
+    def check() -> None:
+        if run.cancel_requested:
+            raise _RunCancelled
+
+    return check
 
 
 class HarnessService:
@@ -84,25 +107,46 @@ class HarnessService:
         The evaluator polls `/v1/runs/<id>` rather than holding a connection
         open: a task can run for hours, and an idle HTTP connection would be
         dropped long before it finished.
+
+        ``task.session_id`` selects the session explicitly; a caller that runs
+        several steps of one case reuses that id so each step continues the
+        same conversation. Omission keeps one fresh session per run.
         """
         instruction = task.get("instruction")
         if not isinstance(instruction, str) or not instruction:
             raise ValueError("task.instruction must be a nonempty string")
+        requested_session = task.get("session_id")
+        if requested_session is not None and (
+            not isinstance(requested_session, str) or not requested_session
+        ):
+            raise ValueError("task.session_id must be a nonempty string")
         run_id = uuid.uuid4().hex
         run = _Run(
             run_id=run_id,
             task_id=str(task.get("task_id") or ""),
             instruction=instruction,
-            session_id=f"session-{run_id}",
+            session_id=requested_session or f"session-{run_id}",
         )
         with self._lock:
             self._runs[run_id] = run
 
         def execute() -> None:
             try:
+                # A cancellation that arrived while this thread waited for the
+                # shared harness must stop the run before it starts work. Both
+                # checks run before a prompt is delivered, so a cancelled run
+                # never begins executing afterwards.
+                if run.cancel_requested:
+                    return
                 harness = self._ensure_started()
-                result = harness.run(instruction, session_id=run.session_id)
-                run.result = {
+                if run.cancel_requested:
+                    return
+                result = harness.run(
+                    instruction,
+                    session_id=run.session_id,
+                    before_deliver=_refuse_when_cancelled(run),
+                )
+                completed = {
                     "final_response": result.final_response,
                     "finish_reason": result.finish_reason,
                     "session_id": result.session_id,
@@ -112,10 +156,27 @@ class HarnessService:
                         for n in result.notifications
                     ],
                 }
-            except Exception as error:  # every failure must reach the caller
-                run.error = f"{type(error).__name__}: {error}"
+                with self._lock:
+                    # Cancellation claims the outcome while this turn settles;
+                    # a late completion must not overwrite it.
+                    if not run.cancel_requested:
+                        run.result = completed
+            except _RunCancelled:
+                # The cancellation landed before this prompt was written, so
+                # the run's state already reports it.
+                pass
+            except Exception as error:
+                # A cancelled run's own abort error is the expected consequence
+                # of the cancellation, not a run failure to report.
+                if not run.cancel_requested:
+                    run.error = f"{type(error).__name__}: {error}"
             finally:
-                run.done.set()
+                # While a cancellation is in flight, only its own path publishes
+                # the terminal state; otherwise the run would read as cancelled
+                # before the harness confirmed it.
+                with self._lock:
+                    if not run.cancel_requested:
+                        run.done.set()
 
         threading.Thread(target=execute, name=f"run-{run_id}", daemon=True).start()
         return run_id
@@ -125,20 +186,69 @@ class HarnessService:
             run = self._runs.get(run_id)
         if run is None:
             return None
+        # Reported before the done flag on purpose: a cancellation still waiting
+        # for the harness to settle must not read as cancelled.
+        if run.cancel_state == "cancelling":
+            return {"run_id": run.run_id, "status": "cancelling"}
         if not run.done.is_set():
             return {"run_id": run.run_id, "status": "running"}
+        if run.cancel_state == "cancelled":
+            return {"run_id": run.run_id, "status": "cancelled"}
         if run.error is not None:
             return {"run_id": run.run_id, "status": "failed", "error": run.error}
         return {"run_id": run.run_id, "status": "completed", **(run.result or {})}
 
     def cancel(self, run_id: str) -> bool:
-        """Mark a run cancelled. The harness finishes its current turn first."""
+        """Cancel one run's session and wait until the harness confirms it stopped.
+
+        Only that run's session is stopped: the shared harness and every other
+        run's session keep running. The run is published as ``cancelled`` only
+        after the harness confirmed the session settled. A run that already
+        finished keeps its recorded outcome. When the harness refuses or fails
+        the cancellation, the run is published as ``failed`` with that error
+        and the failure is raised, so no caller reads a false success.
+
+        Raises:
+            RuntimeError: The harness could not confirm the cancellation.
+        """
         with self._lock:
             run = self._runs.get(run_id)
-        if run is None:
-            return False
-        run.error = run.error or "cancelled"
-        run.done.set()
+            if run is None:
+                return False
+            if run.done.is_set():
+                # Nothing is executing, so there is no work to stop. The stored
+                # outcome already says whether the run completed or failed.
+                return True
+            # Claim the intent under the same lock the worker uses to publish
+            # its result, so a completion settling now is withheld or already
+            # recorded. The state stays ``cancelling`` until the harness
+            # confirms, and only then becomes ``cancelled``.
+            run.cancel_state = "cancelling"
+        # Read the harness under the start lock: a start in progress holds it,
+        # so this either sees no harness (nothing launched yet) or a fully
+        # initialized one. Cancelling calls start() itself otherwise, which
+        # would race the worker's handshake.
+        with self._start_lock:
+            harness = self._harness
+        if harness is None:
+            # The worker has not launched the shared harness yet; its executor
+            # re-checks the intent before it delivers any prompt, so no
+            # cancellation request can reach a session that does not exist.
+            with self._lock:
+                run.cancel_state = "cancelled"
+                run.done.set()
+            return True
+        try:
+            harness.cancel_session(run.session_id)
+        except Exception as error:
+            with self._lock:
+                run.cancel_state = "cancel-failed"
+                run.error = f"cancellation failed: {type(error).__name__}: {error}"
+                run.done.set()
+            raise RuntimeError(run.error) from error
+        with self._lock:
+            run.cancel_state = "cancelled"
+            run.done.set()
         return True
 
 
@@ -162,6 +272,9 @@ def config_from_environment() -> DeepSeekHarnessConfig:
 
     raw_patches = os.environ.get("DSH_PATCHES", "")
     patches = tuple(p.strip() for p in raw_patches.split(":") if p.strip())
+    request_budget = float(os.environ.get("DSH_REQUEST_TIMEOUT_SECONDS", "30"))
+    if not math.isfinite(request_budget) or request_budget <= 0:
+        raise ValueError("DSH_REQUEST_TIMEOUT_SECONDS must be finite and positive")
     return DeepSeekHarnessConfig(
         provider=required("LLM_PROVIDER"),
         model=required("LLM_MODEL"),
@@ -172,6 +285,7 @@ def config_from_environment() -> DeepSeekHarnessConfig:
         base_url=required("LLM_BASE_URL"),
         api_key=required("LLM_API_KEY"),
         initialize_timeout_seconds=float(os.environ.get("DSH_INITIALIZE_TIMEOUT", "300")),
+        request_timeout_seconds=request_budget,
     )
 
 
@@ -228,13 +342,18 @@ def _handler(service: HarnessService) -> type[BaseHTTPRequestHandler]:
                     if not service.cancel(run_id):
                         self._reply(404, {"error": {"message": "run not found"}})
                         return
-                    self._reply(200, {"run_id": run_id, "status": "cancelled"})
+                    state = service.run_state(run_id)
+                    self._reply(200, {"run_id": run_id, "status": state["status"]})
                     return
                 self._reply(404, {"error": {"message": f"no route for {self.path}"}})
             except ValueError as error:
                 self._reply(400, {"error": {"message": str(error)}})
             except json.JSONDecodeError as error:
                 self._reply(400, {"error": {"message": f"invalid JSON: {error}"}})
+            except RuntimeError as error:
+                # A cancellation the harness could not confirm is a failed
+                # request, never a success response.
+                self._reply(500, {"error": {"message": str(error)}})
 
     return Handler
 

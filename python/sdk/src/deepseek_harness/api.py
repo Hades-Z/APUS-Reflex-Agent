@@ -127,15 +127,25 @@ class DeepSeekHarness:
         self.start()
         return Session(self, session_id or f"session-{uuid.uuid4().hex}")
 
+    def cancel_session(self, session_id: str) -> None:
+        """Cancel one session's work and wait until the runtime confirms it stopped.
+
+        The shared runtime and every other session stay alive. Only a confirmed
+        settlement returns; a runtime failure or refusal is raised.
+        """
+        self.start()
+        self._client.session_cancel(session_id)
+
     def run(
         self,
         input: str | list[JsonObject],
         *,
         session_id: str | None = None,
         on_notification: Callable[[Notification], None] | None = None,
+        before_deliver: Callable[[], None] | None = None,
     ) -> RunResult:
         return self.start_session(session_id).run(
-            input, on_notification=on_notification
+            input, on_notification=on_notification, before_deliver=before_deliver
         )
 
 
@@ -149,6 +159,7 @@ class Session:
         input: str | list[JsonObject],
         *,
         on_notification: Callable[[Notification], None] | None = None,
+        before_deliver: Callable[[], None] | None = None,
     ) -> RunResult:
         content_blocks = normalize_input(input)
         notifications: list[Notification] = []
@@ -173,6 +184,7 @@ class Session:
                 self.id,
                 content_blocks,
                 notification_subscription=subscription,
+                before_deliver=before_deliver,
             )
 
             received = False

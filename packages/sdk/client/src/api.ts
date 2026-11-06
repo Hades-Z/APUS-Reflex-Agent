@@ -105,6 +105,17 @@ export class DeepSeekHarness implements AsyncDisposable {
   }
 
   /**
+   * Cancel one session's work and wait until the runtime confirms it stopped.
+   * Other sessions and the runtime process stay alive; a prompt sent afterwards
+   * starts new work on the same session.
+   * @param sessionId - the session to stop.
+   * @returns settlement after the runtime reported the session idle.
+   */
+  cancelSession(sessionId: string): Promise<string> {
+    return this.clientInstance.cancelSession(sessionId)
+  }
+
+  /**
    * Run one prompt on a fresh (or named) session.
    * @param input - prompt text, or content blocks sent verbatim.
    * @param options - optional session id and per-notification observer.

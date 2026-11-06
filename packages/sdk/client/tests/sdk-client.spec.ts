@@ -743,4 +743,40 @@ describe('pure helpers', () => {
       { type: 'assistant/message', seq: 1, time: 0, data: { message: { content: [{ type: 'text', text: 'a' }, { type: 'tool-call' }, { type: 'text', text: 'b' }] } } } as never,
     ])).toBe('ab')
   })
+  it('cancels one named session without closing the runtime', async () => {
+    const cancelFile = join(await tempDir('dsh-sdk-cancel-'), 'cancels.txt')
+    const harness = harnessWith({ FAKE_RECORD_CANCELS: cancelFile })
+    expect(await harness.cancelSession('first')).toBe('first')
+    expect(await harness.cancelSession('second')).toBe('second')
+    expect((await readFile(cancelFile, 'utf8')).trim().split('\n')).toEqual(['first', 'second'])
+    // The runtime is still usable after a cancellation.
+    const result = await harness.run('after cancel')
+    expect(result.finalResponse).toBe('hello from fake runtime')
+  })
+
+  it('reports a cancellation the runtime did not confirm as a protocol error', async () => {
+    const harness = harnessWith({ FAKE_CANCEL_UNCONFIRMED: '1' })
+    await expect(harness.cancelSession('unconfirmed')).rejects.toThrow(SdkProtocolError)
+  })
+
+  it('surfaces a runtime cancellation failure instead of reporting success', async () => {
+    const harness = harnessWith({ FAKE_CANCEL_ERROR: '1' })
+    await expect(harness.cancelSession('refused')).rejects.toThrow(JsonRpcResponseError)
+  })
+
+  it('bounds a cancellation whose runtime never answers', async () => {
+    const client = processClient(fakeLaunch({ FAKE_HANG_CANCEL: '1' }))
+    cleanups.push(() => client.close())
+    await client.initialize({ cwd: process.cwd(), provider: 'p', model: 'm' })
+    const bounded = client as unknown as { runtime: { requestTimeoutMs?: number } }
+    const original = bounded.runtime.requestTimeoutMs
+    bounded.runtime.requestTimeoutMs = 150
+    try {
+      await expect(client.cancelSession('hung')).rejects.toThrow(RequestTimeoutError)
+    } finally {
+      bounded.runtime.requestTimeoutMs = original
+    }
+    await client.close()
+  })
+
 })

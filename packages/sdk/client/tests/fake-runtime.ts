@@ -36,6 +36,11 @@
  *   arrives, then poll for the GO file before answering (deterministic
  *   cancel-during-handshake window).
  * - `FAKE_HANG_PROMPT`: never answer `session/prompt` (for timeout/dispose tests).
+ * - `FAKE_HANG_CANCEL`: accept `session/cancel` but never answer it (cancellation
+ *   timeout probe); emits the prompt turn normally first.
+ * - `FAKE_CANCEL_ERROR`: answer `session/cancel` with a JSON-RPC error response.
+ * - `FAKE_CANCEL_UNCONFIRMED`: answer `session/cancel` with `{ cancelled: false }`.
+ * - `FAKE_RECORD_CANCELS`: append each `session/cancel` sessionId to this file.
  * - `FAKE_EXIT_DURING_PROMPT`: commit one interrupted assistant message, then
  *   exit 17 while the owned session run is waiting for its terminal state.
  * - `FAKE_STREAM_THEN_MALFORMED`: commit a partial assistant attempt for the
@@ -314,6 +319,23 @@ reader.on('line', (line) => {
       runTurn(sessionId)
       notify('session.status', { sessionId, status: 'idle' })
       respond({ messageId })
+      return
+    }
+    case 'session/cancel': {
+      const sessionId = sessionIdOf(frame.params)
+      if (env.FAKE_RECORD_CANCELS !== undefined) appendFileSync(env.FAKE_RECORD_CANCELS, `${sessionId}\n`)
+      if (env.FAKE_HANG_CANCEL !== undefined) return
+      if (env.FAKE_CANCEL_ERROR !== undefined) {
+        write({ jsonrpc: '2.0', id: frame.id, error: { code: 7, message: 'scripted cancel failure' } })
+        return
+      }
+      if (env.FAKE_CANCEL_UNCONFIRMED !== undefined) {
+        respond({ sessionId, cancelled: false })
+        return
+      }
+      event(sessionId, 'turn/end', { turn: 0, reason: { kind: 'aborted', reason: { kind: 'user' } } })
+      notify('session.status', { sessionId, status: 'idle' })
+      respond({ sessionId, cancelled: true })
       return
     }
     case 'shutdown':

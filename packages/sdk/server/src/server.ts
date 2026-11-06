@@ -20,6 +20,8 @@ import type {
   InitializeParams,
   InitializeResult,
   JsonRpcTransportPeer,
+  SessionCancelParams,
+  SessionCancelResult,
   SessionEventNotification,
   SessionPromptParams,
   SessionPromptResult,
@@ -30,6 +32,15 @@ import type {
 
 interface SessionRecord {
   handle: AgentHandle
+}
+
+/** Validate the wire params of one `session/cancel` request. */
+function cancelParams(params: Record<string, unknown> | undefined): SessionCancelParams {
+  const sessionId = params?.sessionId
+  if (typeof sessionId !== 'string' || sessionId === '') {
+    throw new TypeError('session/cancel requires a non-empty sessionId')
+  }
+  return { sessionId }
 }
 
 function encodedImage(block: SessionPromptParams['contentBlocks'][number]): block is SdkEncodedImageBlock {
@@ -81,6 +92,12 @@ export class HarnessSdkJsonRpcServer {
   private llmFiber: { dispose(): Promise<void> } | undefined
   private readonly sessions = new Map<string, SessionRecord>()
   private readonly sessionCreations = new Map<string, Promise<SessionRecord>>()
+  /**
+   * Cancellation generation per session. A prompt snapshots it on arrival and
+   * re-reads it before delivery, so only work that was already in flight when
+   * the cancel landed is refused; a prompt sent afterwards still runs.
+   */
+  private readonly cancelGenerations = new Map<string, number>()
   private readonly disposers: (() => void)[] = []
   private shutdownTask: Promise<Record<string, never>> | undefined
   private shuttingDown = false
@@ -177,6 +194,8 @@ export class HarnessSdkJsonRpcServer {
    */
   async prompt(params: SessionPromptParams): Promise<SessionPromptResult> {
     if (!this.initialized) throw new Error('SDK server is not initialized')
+    // Snapshot before any await: this prompt owns the generation it arrived in.
+    const generation = this.cancelGenerationOf(params.sessionId)
     const rec = await this.getOrCreateSession(params.sessionId)
     // An agent-loop-only reload disposes the loop's agents while this record
     // survives; a retained agent accepts followup() silently, so validate the
@@ -186,12 +205,48 @@ export class HarnessSdkJsonRpcServer {
     // Attachment admission crosses an async boundary where shutdown or an
     // agent-loop reload may detach the retained handle.
     this.assertLiveAgent(rec, params.sessionId)
+    // Re-read after the last await: a cancel that arrived while this prompt
+    // was prepared owns this generation, so the prompt must not start work the
+    // caller already stopped. The check and followup below run without an
+    // await, so a cancel cannot interleave between them.
+    if (this.cancelGenerationOf(params.sessionId) !== generation) {
+      throw new Error(`session was cancelled while this prompt was in flight: ${params.sessionId}`)
+    }
     const message = createUserMessage({
       content,
       source: { kind: 'user' },
     })
     rec.handle.agent.followup(message)
     return { messageId: message.id }
+  }
+
+  private cancelGenerationOf(sessionId: string): number {
+    return this.cancelGenerations.get(sessionId) ?? 0
+  }
+
+  /**
+   * Cancel one session's active and queued work, then wait for it to stop.
+   * Other sessions and the surrounding runtime are untouched.
+   * @param params - the session whose work must stop.
+   * @returns confirmation only after the session reached quiescence.
+   */
+  async cancel(params: SessionCancelParams): Promise<SessionCancelResult> {
+    if (!this.initialized) throw new Error('SDK server is not initialized')
+    // Advance before any await: a prompt already preparing re-reads this
+    // generation before its synchronous delivery and is refused, while a
+    // prompt sent after this call starts a later generation and still runs.
+    this.cancelGenerations.set(params.sessionId, this.cancelGenerationOf(params.sessionId) + 1)
+    const rec = this.sessions.get(params.sessionId)
+    if (rec === undefined) {
+      // No live agent means no work to stop. A prompt still awaiting session
+      // creation is refused by the generation check, so none can start later.
+      return { sessionId: params.sessionId, cancelled: true }
+    }
+    this.assertLiveAgent(rec, params.sessionId)
+    rec.handle.agent.cancel({ kind: 'user' })
+    // Settlement, not the request above, is what this method reports.
+    await rec.handle.agent.whenIdle()
+    return { sessionId: params.sessionId, cancelled: true }
   }
 
   private assertLiveAgent(rec: SessionRecord, sessionId: string): void {
@@ -217,6 +272,7 @@ export class HarnessSdkJsonRpcServer {
     this.sessionCreations.clear()
     const records = [...this.sessions.values()]
     this.sessions.clear()
+    this.cancelGenerations.clear()
     const failures: unknown[] = []
     while (this.disposers.length > 0) {
       try {
@@ -251,6 +307,8 @@ export class HarnessSdkJsonRpcServer {
         return this.initialize(params as unknown as InitializeParams)
       case 'session/prompt':
         return this.prompt(params as unknown as SessionPromptParams)
+      case 'session/cancel':
+        return this.cancel(cancelParams(params))
       case 'shutdown':
         return this.shutdown()
       default:

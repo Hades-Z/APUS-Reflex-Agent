@@ -18,6 +18,7 @@ import {
   JsonRpcResponseError,
   type InitializeParams,
   type InitializeResult,
+  type SessionCancelParams,
   type SessionPromptParams,
   type SdkPromptContentBlock,
 } from '@deepseek-ai/dsh-sdk-protocol'
@@ -295,6 +296,22 @@ export class HarnessClient {
       throw new SdkProtocolError(`session/prompt returned no message id: ${JSON.stringify(result)}`)
     }
     return result.messageId
+  }
+
+  /**
+   * Cancel one session's active and queued work and wait for the runtime to
+   * confirm it stopped. Other sessions keep running; a prompt sent afterwards
+   * starts new work on the same session.
+   * @param sessionId - the session to stop.
+   * @returns the confirmed session id.
+   */
+  async cancelSession(sessionId: string): Promise<string> {
+    const params: SessionCancelParams = { sessionId }
+    const result = await this.request('session/cancel', { ...params })
+    if (!isRecord(result) || result.cancelled !== true || result.sessionId !== sessionId) {
+      throw new SdkProtocolError(`session/cancel did not confirm cancellation: ${JSON.stringify(result)}`)
+    }
+    return sessionId
   }
 
   /**

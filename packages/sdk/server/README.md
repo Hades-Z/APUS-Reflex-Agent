@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-sdk-jsonrpc-server` serves the SDK wire protocol over stdio so out-of-process clients can drive harness agents: it opens one session per `sessionId`, queues user prompts, and streams every session event and agent status transition back to the client. Mount it as the `jsonrpc` plugin in a Loader composition; the surrounding tree supplies everything else — agents, model adapters, persistence, and tools. Stdout carries only JSON-RPC frames, so a deployment must not compose a stdout logger. It answers `shutdown` by disposing the root runtime and exiting 0; the app bin owns EOF and signal exits.
+`dsh-sdk-jsonrpc-server` serves the SDK wire protocol over stdio so out-of-process clients can drive harness agents: it opens one session per `sessionId`, queues user prompts, cancels one session's work on request, and streams every session event and agent status transition back to the client. Mount it as the `jsonrpc` plugin in a Loader composition; the surrounding tree supplies everything else — agents, model adapters, persistence, and tools. Stdout carries only JSON-RPC frames, so a deployment must not compose a stdout logger. It answers `shutdown` by disposing the root runtime and exiting 0; the app bin owns EOF and signal exits.
 
 ## Table of Contents
 
@@ -45,7 +45,7 @@ Stdout carries only JSON-RPC frames, so clients can parse every byte; diagnostic
 
 ### What SDK clients can do
 
-`initialize` is the runtime-readiness boundary: when the server is mounted by a Loader composition, it waits for the current plugin tree to settle before replying, so async sibling capabilities such as initial MCP tool discovery are visible to the first prompt. The handshake returns the wire-stable identity `deepseek-harness-sdk-runtime`. The server validates the provider/model route and optional non-empty `reasoningEffort` through the selected adapter before it stores them; omission stores no effort, so the model retains its own default. An optional positive `maxTokens` becomes the request output cap of each SDK-created agent and its in-process descendants, while omission applies the selected adapter or provider route default. JSON-RPC requests may dispatch concurrently, so `session/prompt` rejects until one `initialize` has completed successfully; clients must await the handshake before sending prompts. An accepted prompt queues one identified user message and immediately returns `{ messageId }`; the server then streams every durable fact as `session.event` and every whole-agent lifecycle transition as `session.status`. It does not assign an assistant message or `turn/end` to a prompt, and independent requests may enqueue more work on the same session. Persistence roots and persona come from the surrounding composition.
+`initialize` is the runtime-readiness boundary: when the server is mounted by a Loader composition, it waits for the current plugin tree to settle before replying, so async sibling capabilities such as initial MCP tool discovery are visible to the first prompt. The handshake returns the wire-stable identity `deepseek-harness-sdk-runtime`. The server validates the provider/model route and optional non-empty `reasoningEffort` through the selected adapter before it stores them; omission stores no effort, so the model retains its own default. An optional positive `maxTokens` becomes the request output cap of each SDK-created agent and its in-process descendants, while omission applies the selected adapter or provider route default. JSON-RPC requests may dispatch concurrently, so `session/prompt` rejects until one `initialize` has completed successfully; clients must await the handshake before sending prompts. An accepted prompt queues one identified user message and immediately returns `{ messageId }`; the server then streams every durable fact as `session.event` and every whole-agent lifecycle transition as `session.status`. It does not assign an assistant message or `turn/end` to a prompt, and independent requests may enqueue more work on the same session. `session/cancel` calls the live agent's `cancel({ kind: 'user' })` for one session and awaits `whenIdle()`, so it answers only after that session stopped; every other session and the surrounding runtime keep running. A prompt already in flight when the cancel landed is refused instead of starting work; a prompt sent afterwards starts a new turn on the same session. A session with no live agent yet needs no stop, and the in-flight prompt is still refused. Persistence roots and persona come from the surrounding composition.
 
 ### Shutdown and exit
 
@@ -75,7 +75,7 @@ The plugin is a thin presentation adapter: [`HarnessSdkJsonRpcServer`](src/serve
 
 ### Request flow
 
-Each protocol method validates its inputs and resolves the owning state before acting — `initialize` stores the SDK route, `session/prompt` resolves the live agent+session pair and queues the message, and `shutdown` flushes the response, then disposes the root context to quiescence before exiting 0 — and a shared exit task guarantees that racing `shutdown` requests never dispose or exit twice. The dispatch lives in [src/index.ts](src/index.ts) and [src/server.ts](src/server.ts).
+Each protocol method validates its inputs and resolves the owning state before acting — `initialize` stores the SDK route, `session/prompt` resolves the live agent+session pair and queues the message, `session/cancel` marks the session cancelled, stops its live agent, and awaits its idle transition, and `shutdown` flushes the response, then disposes the root context to quiescence before exiting 0 — and a shared exit task guarantees that racing `shutdown` requests never dispose or exit twice. The dispatch lives in [src/index.ts](src/index.ts) and [src/server.ts](src/server.ts).
 
 ### Teardown
 
@@ -122,7 +122,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 These limits define when the plugin needs special operational care. They are current package constraints, not a comparison with other serving approaches or a task backlog.
 
-- **The wire has no per-session close or prompt-cancel method** — SDK-created agents remain live until process shutdown.
+- **Cancellation is session-wide and produces no result** — `session/cancel` stops the session's active turn and clears its queued work; there is no per-prompt cancel, and SDK-created agents remain live until process shutdown.
 - **There is no per-prompt result** — `MessageId` identifies inbox admission only; clients that own an automation interval must define and observe that interval themselves.
 - **stdout purity is deployment-enforced** — a surrounding config can still load a stdout logger and corrupt the JSON-RPC channel; this plugin does not inspect or veto sibling loggers.
 - **Automatic adapter mounting is DeepSeek-specific** — `initialize` can reuse any pre-registered model adapter, but its only fallback mounts the DeepSeek adapter.

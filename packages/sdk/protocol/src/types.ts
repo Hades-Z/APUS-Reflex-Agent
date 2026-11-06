@@ -1,5 +1,5 @@
 /**
- * Named wire types for the APUS Reflex Harness SDK runtime protocol: the three
+ * Named wire types for the APUS Reflex Harness SDK runtime protocol: the four
  * request/result pairs and the four server-to-client notification payloads
  * exchanged over the newline-delimited JSON-RPC stdio transport. The server
  * plugin (`@deepseek-ai/dsh-sdk-jsonrpc-server`) and SDK clients share these shapes;
@@ -56,6 +56,20 @@ export type SdkPromptContentBlock = ContentBlock | SdkEncodedImageBlock
 export interface SessionPromptResult {
   /** Identity of the queued user message. */
   messageId: string
+}
+
+/** One cancellation target. */
+export interface SessionCancelParams {
+  /** Session whose active work must stop; a session that has not started is refused for later prompts. */
+  sessionId: string
+}
+
+/** Confirmation that the runtime holds no active work for the session. */
+export interface SessionCancelResult {
+  /** The session that reached quiescence. */
+  sessionId: string
+  /** Always `true`; a failure is reported as a JSON-RPC error instead. */
+  cancelled: true
 }
 
 /** Deployment-mapped SDK outcome: `ok` for an accepted result, `error` otherwise. */
@@ -115,5 +129,6 @@ export interface HarnessSdkNotificationMap {
 export interface HarnessSdkRequestMap {
   'initialize': { params: InitializeParams; result: InitializeResult }
   'session/prompt': { params: SessionPromptParams; result: SessionPromptResult }
+  'session/cancel': { params: SessionCancelParams; result: SessionCancelResult }
   'shutdown': { params: undefined; result: Record<string, never> }
 }
