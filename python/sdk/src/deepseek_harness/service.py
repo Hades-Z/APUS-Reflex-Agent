@@ -20,7 +20,7 @@ import math
 import os
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
@@ -35,6 +35,9 @@ class _Run:
     task_id: str
     instruction: str
     session_id: str
+    # The harness instance this run was bound to. Cancellation must reach the
+    # same instance, which is not necessarily the deployment's own route.
+    route: tuple[str, ...] = ()
     result: dict[str, Any] | None = None
     error: str | None = None
     # ``none`` → ``cancelling`` → ``cancelled`` | ``cancel-failed``. Only a
@@ -52,6 +55,65 @@ class _RunCancelled(Exception):
     """Internal signal: the run was cancelled before its prompt was delivered."""
 
 
+# The per-run route fields, and the environment names the harness profile reads
+# them from. Both are needed: ``initialize`` names the provider and model, while
+# the profile's route (its gateway base URL and key) is read from the runtime
+# subprocess environment. Setting only one would advertise a model the profile
+# never reaches.
+_ROUTE_FIELDS = ("model", "base_url", "api_key")
+_ROUTE_ENV = {
+    "model": "LLM_MODEL",
+    "base_url": "LLM_BASE_URL",
+    "api_key": "LLM_API_KEY",
+}
+
+
+def _route_env(route: dict[str, str]) -> dict[str, str]:
+    return {_ROUTE_ENV[name]: value for name, value in route.items() if name in _ROUTE_ENV}
+
+
+def _route_key(config: DeepSeekHarnessConfig) -> tuple[str, ...]:
+    """Which route a harness belongs to, as the values that fix it at start.
+
+    The model and endpoint are what the runtime cannot change after it
+    initializes; the key is part of the same identity so two evaluations using
+    different credentials never share a runtime.
+    """
+    return (
+        config.provider,
+        config.model,
+        config.base_url or "",
+        config.api_key or "",
+    )
+
+
+def _route_from_task(task: dict[str, Any]) -> dict[str, str]:
+    """The model route one run asked for, rejecting values a run cannot carry.
+
+    Validation happens here, before the run is registered: a malformed route
+    must not produce a run that fails only after it starts.
+    """
+    llm = task.get("llm")
+    if llm is None:
+        return {}
+    if not isinstance(llm, dict):
+        raise ValueError("task.llm must be an object")
+    route: dict[str, str] = {}
+    for field in _ROUTE_FIELDS:
+        value = llm.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"task.llm.{field} must be a nonempty string")
+        route[field] = value.strip()
+    base_url = route.get("base_url")
+    if base_url is not None and not (
+        base_url.startswith("http://") or base_url.startswith("https://")
+    ):
+        raise ValueError("task.llm.base_url must be an http(s) URL")
+    return route
+
+
 def _refuse_when_cancelled(run: _Run) -> Callable[[], None]:
     """Build the delivery-point check for one run's prompt."""
 
@@ -65,23 +127,36 @@ def _refuse_when_cancelled(run: _Run) -> Callable[[], None]:
 class HarnessService:
     """Drives the harness over HTTP for an external evaluator.
 
-    One harness instance is kept alive across runs: starting it is the expensive
-    part, and a per-request process would pay that cost every time. Runs are
-    isolated by session id and by their own working directory.
+    One harness instance is kept alive per model route: starting it is the
+    expensive part, and a per-request process would pay that cost every time.
+    Runs are isolated by session id and by their own working directory.
+
+    A run may name the route it wants (``model``, ``base_url``, ``api_key``),
+    so one long-lived service serves several models without a restart. A run
+    that names none uses the deployment's own route and shares that harness.
     """
 
-    def __init__(self, config: DeepSeekHarnessConfig) -> None:
+    def __init__(
+        self,
+        config: DeepSeekHarnessConfig,
+        *,
+        harness_factory: Callable[[DeepSeekHarnessConfig], Any] | None = None,
+    ) -> None:
         self._config = config
-        self._harness: DeepSeekHarness | None = None
+        # One harness per route, keyed by what actually selects the model. Two
+        # runs naming the same route share it; a different route gets its own,
+        # because the model is fixed when the runtime is initialized.
+        self._harnesses: dict[tuple[str, ...], Any] = {}
+        self._factory = harness_factory or DeepSeekHarness
         self._runs: dict[str, _Run] = {}
         self._lock = threading.Lock()
-        # Guards the harness construction and its one-time start. Kept apart
-        # from ``_lock``, which guards the run registry: holding the registry
-        # lock across a spawn would block every status poll for its duration.
+        # Guards harness construction and its one-time start per route. Kept
+        # apart from ``_lock``, which guards the run registry: holding the
+        # registry lock across a spawn would block every status poll.
         self._start_lock = threading.Lock()
 
-    def _ensure_started(self) -> DeepSeekHarness:
-        """Start the harness once, even when several runs ask at the same time.
+    def _ensure_started(self, route: dict[str, str]) -> Any:
+        """Start this route's harness once, even when several runs ask together.
 
         Each run executes on its own worker thread, so two runs arriving
         together reach this method together. ``start()`` checks whether a
@@ -95,11 +170,47 @@ class HarnessService:
         on purpose: the expensive part happens once, and a caller that arrives
         later simply waits for that one start instead of beginning its own.
         """
+        config = self._config_for(route)
+        key = _route_key(config)
         with self._start_lock:
-            if self._harness is None:
-                self._harness = DeepSeekHarness(self._config)
-            self._harness.start()
-            return self._harness
+            harness = self._harnesses.get(key)
+            if harness is None:
+                harness = self._factory(config)
+                self._harnesses[key] = harness
+            harness.start()
+            return harness
+
+    def _config_for(self, route: dict[str, str]) -> DeepSeekHarnessConfig:
+        """The deployment's configuration with the run's own route applied."""
+        if not route:
+            return self._config
+        return replace(
+            self._config,
+            **{
+                "model": route.get("model", self._config.model),
+                "base_url": route.get("base_url", self._config.base_url),
+                "api_key": route.get("api_key", self._config.api_key),
+                "env": {**self._config.env, **_route_env(route)},
+            },
+        )
+
+    def close(self) -> None:
+        """Stop every harness this service started.
+
+        One service can now hold a harness per model route, each owning its own
+        runtime subprocess. Leaving them to process exit leaks a runtime per
+        route for as long as the service lives, so shutdown closes them all.
+        """
+        with self._start_lock:
+            harnesses, self._harnesses = list(self._harnesses.values()), {}
+        for harness in harnesses:
+            close = getattr(harness, "close", None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception as error:  # noqa: BLE001 - one route must not block the rest
+                print(f"dsh-service: closing a harness failed: {error}", flush=True)
 
     def start_run(self, task: dict[str, Any]) -> str:
         """Accept one task and begin executing it on a worker thread.
@@ -111,6 +222,10 @@ class HarnessService:
         ``task.session_id`` selects the session explicitly; a caller that runs
         several steps of one case reuses that id so each step continues the
         same conversation. Omission keeps one fresh session per run.
+
+        ``task.llm.model``, ``task.llm.base_url`` and ``task.llm.api_key`` name
+        the route this run needs. A run that names none uses the deployment's
+        route.
         """
         instruction = task.get("instruction")
         if not isinstance(instruction, str) or not instruction:
@@ -120,12 +235,14 @@ class HarnessService:
             not isinstance(requested_session, str) or not requested_session
         ):
             raise ValueError("task.session_id must be a nonempty string")
+        route = _route_from_task(task)
         run_id = uuid.uuid4().hex
         run = _Run(
             run_id=run_id,
             task_id=str(task.get("task_id") or ""),
             instruction=instruction,
             session_id=requested_session or f"session-{run_id}",
+            route=_route_key(self._config_for(route)),
         )
         with self._lock:
             self._runs[run_id] = run
@@ -138,7 +255,7 @@ class HarnessService:
                 # never begins executing afterwards.
                 if run.cancel_requested:
                     return
-                harness = self._ensure_started()
+                harness = self._ensure_started(route)
                 if run.cancel_requested:
                     return
                 result = harness.run(
@@ -226,10 +343,12 @@ class HarnessService:
             run.cancel_state = "cancelling"
         # Read the harness under the start lock: a start in progress holds it,
         # so this either sees no harness (nothing launched yet) or a fully
-        # initialized one. Cancelling calls start() itself otherwise, which
-        # would race the worker's handshake.
+        # initialized one. The instance must be the one this run was bound to:
+        # with several routes alive, cancelling through another route's harness
+        # would leave the run's own session working. Cancelling calls start()
+        # itself otherwise, which would race the worker's handshake.
         with self._start_lock:
-            harness = self._harness
+            harness = self._harnesses.get(run.route)
         if harness is None:
             # The worker has not launched the shared harness yet; its executor
             # re-checks the intent before it delivers any prompt, so no
@@ -369,6 +488,7 @@ def serve(host: str, port: int) -> None:
         pass
     finally:
         server.server_close()
+        service.close()
 
 
 def main() -> int:

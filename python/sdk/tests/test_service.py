@@ -65,10 +65,9 @@ class _FakeHarness:
 
 
 def _service(harness: _FakeHarness) -> HarnessService:
-    service = HarnessService(DeepSeekHarnessConfig())
-    # The fake owns no subprocess, so it is installed directly.
-    service._harness = harness
-    return service
+    # The fake owns no subprocess, so it is installed as the only route's
+    # instance. Every run in these tests names no route, so they all reach it.
+    return HarnessService(DeepSeekHarnessConfig(), harness_factory=lambda _config: harness)
 
 
 def _wait_for(predicate, description: str, timeout: float = 2.0) -> None:
@@ -148,8 +147,7 @@ def test_cancel_before_the_run_starts_prevents_it_from_starting() -> None:
             super().start()
 
     harness = _SlowStartHarness()
-    service = HarnessService(DeepSeekHarnessConfig())
-    service._harness = harness
+    service = HarnessService(DeepSeekHarnessConfig(), harness_factory=lambda _config: harness)
     run_id = service.start_run({"instruction": "late", "session_id": "pending"})
     _wait_for(lambda: harness.starting.is_set(), "the shared start to begin")
 
@@ -235,9 +233,9 @@ def test_cancel_waits_for_an_in_progress_shared_start() -> None:
             super().cancel_session(session_id)
 
     harness = _StartingHarness()
-    service = HarnessService(DeepSeekHarnessConfig())
-    # The shared harness exists but its start() is what the worker is inside.
-    service._harness = harness
+    # The harness exists but its start() is what the worker is inside; the
+    # factory returns it once, then the service holds it as this route's one.
+    service = HarnessService(DeepSeekHarnessConfig(), harness_factory=lambda _config: harness)
     run_id = service.start_run({"instruction": "work", "session_id": "starting"})
     _wait_for(starting.is_set, "the shared start to begin")
     assert calls == []
@@ -364,3 +362,110 @@ def test_http_cancel_keeps_an_already_completed_outcome():
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+class _RecordingHarness(_FakeHarness):
+    """One harness instance per model route, so the route a run used is visible."""
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.config = config
+
+    def run(self, instruction, *, session_id=None, before_deliver=None):
+        self.gate.set()
+        return super().run(instruction, session_id=session_id, before_deliver=before_deliver)
+
+
+@dataclass
+class _Routes:
+    """Stands in for the harness factory: one instance keyed by model route."""
+
+    created: list = None
+
+    def __post_init__(self) -> None:
+        self.created = []
+
+    def __call__(self, config) -> _RecordingHarness:
+        harness = _RecordingHarness(config)
+        self.created.append(harness)
+        return harness
+
+
+def test_two_runs_can_name_different_models_within_one_service() -> None:
+    routes = _Routes()
+    service = HarnessService(DeepSeekHarnessConfig(model="default-model"), harness_factory=routes)
+    for harness in routes.created:
+        harness.gate.set()
+
+    first = service.start_run({"instruction": "one", "llm": {"model": "model-a"}})
+    _wait_for(lambda: service.run_state(first)["status"] == "completed", "first run")
+    second = service.start_run({"instruction": "two", "llm": {"model": "model-b"}})
+    _wait_for(lambda: service.run_state(second)["status"] == "completed", "second run")
+
+    models = sorted(h.config.model for h in routes.created if h.prompts)
+    assert models == ["model-a", "model-b"], models
+
+
+def test_a_run_without_a_route_reuses_the_deployment_model() -> None:
+    routes = _Routes()
+    service = HarnessService(DeepSeekHarnessConfig(model="default-model"), harness_factory=routes)
+    for harness in routes.created:
+        harness.gate.set()
+
+    run_id = service.start_run({"instruction": "plain"})
+    _wait_for(lambda: service.run_state(run_id)["status"] == "completed", "run")
+
+    assert len(routes.created) == 1
+    assert routes.created[0].config.model == "default-model"
+
+
+def test_a_malformed_route_is_refused_before_any_run_starts() -> None:
+    routes = _Routes()
+    service = HarnessService(DeepSeekHarnessConfig(model="default-model"), harness_factory=routes)
+    with pytest.raises(ValueError):
+        service.start_run({"instruction": "x", "llm": {"model": ""}})
+    with pytest.raises(ValueError):
+        service.start_run({"instruction": "x", "llm": {"base_url": "not-a-url"}})
+    assert routes.created == []
+
+
+def test_closing_the_service_stops_every_route_it_started() -> None:
+    """One service holds a harness per route; each owns its own runtime."""
+    closed: list[str] = []
+
+    class _Closable(_FakeHarness):
+        def __init__(self, config) -> None:
+            super().__init__()
+            self.config = config
+            self.gate.set()
+
+        def close(self) -> None:
+            closed.append(self.config.model)
+
+    def factory(config):
+        return _Closable(config)
+
+    service = HarnessService(DeepSeekHarnessConfig(model="base"), harness_factory=factory)
+    for model in ("model-a", "model-b"):
+        run_id = service.start_run({"instruction": "x", "llm": {"model": model}})
+        _wait_for(lambda: service.run_state(run_id)["status"] == "completed", "run")
+
+    service.close()
+
+    assert sorted(closed) == ["model-a", "model-b"]
+
+
+def test_closing_twice_is_harmless() -> None:
+    class _Closable(_FakeHarness):
+        def __init__(self, config) -> None:
+            super().__init__()
+            self.gate.set()
+
+        def close(self) -> None:
+            return None
+
+    service = HarnessService(DeepSeekHarnessConfig(), harness_factory=lambda c: _Closable(c))
+    run_id = service.start_run({"instruction": "x"})
+    _wait_for(lambda: service.run_state(run_id)["status"] == "completed", "run")
+    service.close()
+    service.close()
