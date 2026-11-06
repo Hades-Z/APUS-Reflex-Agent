@@ -1245,7 +1245,7 @@ describe('HarnessSdkJsonRpcServer', () => {
     await new Promise(resolve => setTimeout(resolve, 20))
     // The reply waits for the agent's own settlement, not just the request.
     expect(settled).toBe(false)
-    idle.resolve()
+    idle.resolve(undefined)
     await expect(cancellation).resolves.toEqual({ sessionId: 'main', cancelled: true })
     expect(mainCancel).toHaveBeenCalledWith({ kind: 'user' })
     expect(mainWhenIdle).toHaveBeenCalledOnce()
@@ -1315,7 +1315,7 @@ describe('HarnessSdkJsonRpcServer', () => {
     await vi.waitFor(() => { expect(saveImages).toHaveBeenCalledOnce() })
     // Cancel lands while the prompt awaits attachment admission.
     const cancel = server.cancel({ sessionId: 'racing' })
-    admission.resolve()
+    admission.resolve(undefined)
     await expect(pending).rejects.toThrow('cancelled while this prompt was in flight')
     await expect(cancel).resolves.toEqual({ sessionId: 'racing', cancelled: true })
     expect(followup).not.toHaveBeenCalled()
@@ -1376,9 +1376,9 @@ describe('HarnessSdkJsonRpcServer', () => {
         const sessionId = String(options.sessionId)
         const begin = Promise.withResolvers<undefined>()
         const gate = Promise.withResolvers<undefined>()
-        started.set(sessionId, begin.resolve)
-        gates.set(sessionId, gate.resolve)
-        begin.resolve()
+        started.set(sessionId, () => begin.resolve(undefined))
+        gates.set(sessionId, () => gate.resolve(undefined))
+        begin.resolve(undefined)
         yield { type: 'block-start', index: 0, blockType: 'text' }
         await Promise.race([
           gate.promise,
@@ -1418,7 +1418,7 @@ describe('HarnessSdkJsonRpcServer', () => {
         notification.method === 'session.event'
         && notification.params?.sessionId === 'first'
         && (notification.params.event as { type?: string } | undefined)?.type === 'turn/end')
-      expect((firstEnding?.params.event as { data?: { reason?: unknown } }).data?.reason)
+      expect((firstEnding?.params?.event as { data?: { reason?: unknown } } | undefined)?.data?.reason)
         .toEqual({ kind: 'aborted', reason: { kind: 'user' } })
 
       // The second session never observed an abort: its gate is still open.

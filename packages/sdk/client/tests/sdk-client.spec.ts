@@ -774,7 +774,8 @@ describe('pure helpers', () => {
     try {
       await expect(client.cancelSession('hung')).rejects.toThrow(RequestTimeoutError)
     } finally {
-      bounded.runtime.requestTimeoutMs = original
+      if (original === undefined) delete bounded.runtime.requestTimeoutMs
+      else bounded.runtime.requestTimeoutMs = original
     }
     await client.close()
   })
