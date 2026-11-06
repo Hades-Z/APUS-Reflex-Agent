@@ -34,6 +34,16 @@
         endpoint: !!js 'process.env.JEV_ENDPOINT?.trim()'
         model: !!js 'process.env.JEV_MODEL?.trim()'
         apiKeyEnv: JEV_API_KEY
+        # The evaluation gateway is a vLLM OpenAI-compatible server, so decisions
+        # are asked in words and read from token probabilities. `openjev` would
+        # call /v1/systemone, which that server does not serve.
+        protocol: !!js 'process.env.JEV_PROTOCOL?.trim() || "chat-completions"'
+        # The served model thinks before answering unless its chat template is
+        # told not to, which outlasts System3's 3 s skill-selection deadline:
+        # 330 output tokens / 4.9 s with thinking on versus 2 tokens / 0.17 s
+        # off for the same verdict. Switch it off through the deployment.
+        chatTemplateKwargs:
+          enable_thinking: !!js 'process.env.JEV_ENABLE_THINKING === "true"'
 
     # Continuum's two halves: the memory service and the Jev bridge that
     # admits and indexes what the service writes.
