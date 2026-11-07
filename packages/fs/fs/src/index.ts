@@ -126,10 +126,15 @@ export abstract class FileSystem extends Service {
    * async even though the local backend only normalizes + realpaths.
    *
    * @param path - the path to resolve; relative paths resolve against `opts.cwd`.
-   * @param opts - optional cwd override and cancellation signal.
+   * @param opts - optional cwd override, cancellation signal, and the agent this
+   *   call acts for (a provider whose execution world is another container
+   *   needs the agent to know which one).
    * @returns the stable target; the same file yields the same `targetKey`.
    */
-  abstract resolve(path: string, opts?: { cwd?: string; signal?: AbortSignal }): Promise<FsTarget>
+  abstract resolve(
+    path: string,
+    opts?: { cwd?: string; signal?: AbortSignal; agentId?: string },
+  ): Promise<FsTarget>
 
   /**
    * Return the canonical absolute path a subprocess in this filesystem's

@@ -33,7 +33,19 @@
 - id: bash-sandbox
   disabled: true
 
+# The same reason applies to files: `read`, `write`, `glob` and `grep` would
+# otherwise answer about this container instead of the task's.
+- id: fs-sandbox
+  disabled: true
+
 - insert:
+    - id: fs-remote
+      name: /workspace/packages/fs/fs-remote/lib/index.js
+      config:
+        endpoint: !!js 'process.env.PIPELINE_EXEC_ENDPOINT?.trim()'
+        token: !!js 'process.env.PIPELINE_API_TOKEN?.trim()'
+        timeoutSec: !!js 'Number(process.env.PIPELINE_FS_TIMEOUT_SEC || 120)'
+
     - id: bash-remote
       name: /workspace/packages/shell/bash-remote/lib/index.js
       config:
