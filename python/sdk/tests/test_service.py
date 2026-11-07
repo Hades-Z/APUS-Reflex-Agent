@@ -718,3 +718,28 @@ def test_a_cancelled_run_still_closes_its_trace() -> None:
     assert final["case_id"] == "case-cancelled"
     assert final["event"]["type"] == "run/end"
     assert final["event"]["data"]["status"] == "cancelled"
+
+
+def test_the_served_service_actually_delivers_its_reports() -> None:
+    """A service given nowhere to report keeps everything to itself.
+
+    The callbacks are what carry events to the evaluator and the outcome back
+    to the benchmark. Leaving them unset meant a run finished with no trace
+    and no verdict, while every request looked successful.
+    """
+    from deepseek_harness.service import HarnessService, http_sink
+
+    sink = http_sink()
+    assert hasattr(sink, "post")
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(),
+        harness_factory=lambda _config: _FakeHarness(),
+        result_callback=sink,
+        event_callback=sink,
+    )
+    try:
+        assert service._event_callback is sink
+        assert service._result_callback is sink
+    finally:
+        service.close()

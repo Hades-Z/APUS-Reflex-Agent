@@ -689,9 +689,47 @@ def _handler(service: HarnessService) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+class _HttpSink:
+    """Posts a report to one URL, using only the standard library.
+
+    The service has no HTTP client dependency, and adding one for two calls
+    would be a platform choice this package does not otherwise make.
+    """
+
+    def post(self, url: str, payload: dict[str, Any], timeout: float) -> None:
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                response.read()
+        except urllib.error.HTTPError as error:
+            raise RuntimeError(f"{url} answered {error.code}") from error
+
+
+def http_sink() -> _HttpSink:
+    """The report sender the served service uses.
+
+    Both callbacks need one: without them a run's events never reach the
+    evaluator and its outcome never reaches the benchmark, while every HTTP
+    request still looks successful.
+    """
+    return _HttpSink()
+
+
 def serve(host: str, port: int) -> None:
     """Run the harness service until the process is stopped."""
-    service = HarnessService(config_from_environment())
+    sink = http_sink()
+    service = HarnessService(
+        config_from_environment(),
+        result_callback=sink,
+        event_callback=sink,
+    )
     server = ThreadingHTTPServer((host, port), _handler(service))
     print(f"dsh-service: listening on {host}:{port}", flush=True)
     try:
