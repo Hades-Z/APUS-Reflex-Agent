@@ -19,6 +19,7 @@ import json
 import math
 import os
 import threading
+import time
 import uuid
 from urllib.parse import urlsplit
 from dataclasses import dataclass, field, replace
@@ -53,6 +54,10 @@ class _Run:
     # How many events this run has reported, which is the source sequence the
     # evaluator de-dupes and orders by.
     reported: int = 0
+    # Reports the evaluator did not accept, oldest first. They keep their
+    # sequence numbers: the receiver writes a contiguous run only, so skipping
+    # one would hold every event after it.
+    undelivered: list[dict[str, Any]] = field(default_factory=list)
     result: dict[str, Any] | None = None
     error: str | None = None
     # ``none`` → ``cancelling`` → ``cancelled`` | ``cancel-failed``. Only a
@@ -348,6 +353,7 @@ class HarnessService:
                     # a late completion must not overwrite it.
                     if not run.cancel_requested:
                         run.result = completed
+                self._report_run_end(run, "succeeded")
                 self._report_result(run, "succeeded")
             except _RunCancelled:
                 # The cancellation landed before this prompt was written, so
@@ -358,6 +364,7 @@ class HarnessService:
                 # of the cancellation, not a run failure to report.
                 if not run.cancel_requested:
                     run.error = f"{type(error).__name__}: {error}"
+                    self._report_run_end(run, "failed")
                     self._report_result(run, "failed")
             finally:
                 # While a cancellation is in flight, only its own path publishes
@@ -375,7 +382,14 @@ class HarnessService:
 
         The SDK delivers notifications on the turn's own thread; a slow or
         unreachable trace service must never hold up the model loop, so a
-        delivery failure is reported and dropped rather than raised into it.
+        delivery failure is retried on the next event and then dropped rather
+        than raised into it.
+
+        The sequence number is the receiver's ordering key, and it writes only
+        a contiguous run of events. Consuming a number for an event that never
+        arrived left every later event held and the case with no trace, so a
+        report keeps its number until it is delivered, and the next report
+        retries it first.
         """
         callback = self._event_callback
         if callback is None or not run.event_url:
@@ -396,13 +410,76 @@ class HarnessService:
             "run_user": run.run_user,
             "event": event,
         }
+        self._deliver(run, body)
+
+    def _deliver(self, run: _Run, body: dict[str, Any]) -> None:
+        """Send this report after anything still waiting, in sequence order.
+
+        A report the evaluator did not accept keeps its place: the receiver
+        writes a contiguous run only, so sending the next number over a gap
+        would leave every later event held.
+        """
+        pending = [*run.undelivered, body]
+        run.undelivered = []
+        for index, report in enumerate(pending):
+            if self._post_event(run, report):
+                continue
+            run.undelivered = pending[index:]
+            return
+
+    def _post_event(self, run: _Run, body: dict[str, Any]) -> bool:
+        """Deliver one report, whether it succeeded, without raising."""
+        callback = self._event_callback
+        assert callback is not None
         try:
             callback.post(
                 run.event_url, body,
                 timeout=float(os.environ.get("DSH_EVENT_TIMEOUT_SEC", "5")),
             )
         except Exception as error:  # noqa: BLE001 - the run must keep going
-            print(f"[dsh-service] event report failed for {run.run_id}: {error}", flush=True)
+            print(
+                f"[dsh-service] event report failed for {run.run_id} "
+                f"(seq {body['seq']}): {error}",
+                flush=True,
+            )
+            return False
+        return True
+
+    def _report_run_end(self, run: _Run, status: str) -> None:
+        """Close this case's trace with the run's own ending facts.
+
+        The receiver keeps a trace open until a report says the case is over,
+        and an open trace is never exported — so a run whose events all arrived
+        still left nothing behind. This is the last report of the sequence, and
+        it carries what the run ended with rather than an empty close.
+        """
+        callback = self._event_callback
+        if callback is None or not run.event_url:
+            return
+        result = run.result or {}
+        run.reported += 1
+        body = {
+            "evaluation_id": run.evaluation_id or run.request_id or run.run_id,
+            "case_id": run.case_id,
+            "source_session_id": run.session_id,
+            "seq": run.reported,
+            "first_seq": 1,
+            "final": True,
+            "question": run.instruction,
+            "run_user": run.run_user,
+            "event": {
+                "type": "run/end",
+                "seq": run.reported,
+                "time": int(time.time() * 1000),
+                "data": {
+                    "status": status,
+                    "finish_reason": result.get("finish_reason"),
+                    "final_response": result.get("final_response"),
+                    "error": run.error,
+                },
+            },
+        }
+        self._deliver(run, body)
 
     def _report_result(self, run: _Run, status: str) -> None:
         """Tell the submitting caller how this run ended.

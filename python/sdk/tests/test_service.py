@@ -33,6 +33,10 @@ class _FakeHarness:
         self.cancel_failure: Exception | None = None
         self.gate = threading.Event()
         self.started_gate = threading.Event()
+        # The notifications this fake reports while the run executes. A test
+        # that needs several events replaces them; the default is one event and
+        # one status, which is what a one-step turn produces.
+        self.notifications: list[Notification] | None = None
 
     def start(self) -> None:
         self.started += 1
@@ -50,7 +54,7 @@ class _FakeHarness:
         self.prompts.append((instruction, session_id or ""))
         self.started_gate.set()
         self.gate.wait(timeout=5)
-        notifications = [
+        notifications = self.notifications or [
             Notification(method="session.event", payload={"sessionId": session_id or "", "event": {"type": "turn/start", "seq": 1, "time": 1, "data": {"turn": 1}}}),
             Notification(method="session.status", payload={"status": "idle"}),
         ]
@@ -581,3 +585,93 @@ def test_events_are_reported_under_the_evaluation_that_sent_the_case() -> None:
     _wait_for(lambda: events, "at least one event to be reported")
 
     assert events[0]["evaluation_id"] == "eval-run-9"
+
+
+def test_a_failed_event_report_does_not_leave_a_gap_the_trace_can_never_fill() -> None:
+    """The receiver writes in order and stops at the first missing sequence.
+
+    A report dropped after its sequence was consumed left a hole that no later
+    event could fill: everything that followed stayed held, and the case ended
+    with no trace at all. A report that cannot be delivered keeps its place in
+    the sequence, so what does get through is still contiguous.
+    """
+    harness = _FakeHarness()
+    delivered: list[int] = []
+    calls: list[int] = []
+
+    class _FlakyEvents:
+        def post(self, url: str, payload: dict[str, Any], timeout: float) -> None:
+            calls.append(payload["seq"])
+            if len(calls) == 2:
+                raise OSError("temporarily unreachable")
+            delivered.append(payload["seq"])
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(),
+        harness_factory=lambda _config: harness,
+        event_callback=_FlakyEvents(),
+    )
+    harness.notifications = [
+        Notification(
+            method="session.event",
+            payload={"sessionId": "s", "event": {
+                "type": "turn/start", "seq": n, "time": n, "data": {},
+            }},
+        )
+        for n in (1, 2, 3)
+    ]
+    service.start_run({
+        "instruction": "do it",
+        "case_id": "case-8",
+        "evaluation_id": "eval-run-8",
+        "event_url": "http://autoeval.invalid/v1/events",
+    })
+    _wait_for(lambda: harness.started_gate.is_set(), "the run to reach the harness")
+    harness.gate.set()
+    _wait_for(lambda: len(delivered) >= 2, "the surviving events to be delivered")
+
+    # Sequence 2 was asked for again after failing, so the receiver never sees
+    # 1 then 3 with 2 missing. The closing report follows at the next number.
+    assert calls[:4] == [1, 2, 2, 3]
+    assert delivered[:3] == [1, 2, 3]
+
+
+def test_the_run_closes_its_trace_once_it_has_ended() -> None:
+    """No report ever said the case was over.
+
+    The receiver keeps a case's trace open until a report marks it final, and
+    an open trace is never exported: a run whose events all arrived still left
+    nothing behind.
+    """
+    harness = _FakeHarness()
+    events: list[dict[str, Any]] = []
+
+    class _Events:
+        def post(self, url: str, payload: dict[str, Any], timeout: float) -> None:
+            events.append({"url": url, **payload})
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(),
+        harness_factory=lambda _config: harness,
+        event_callback=_Events(),
+    )
+    service.start_run({
+        "instruction": "do it",
+        "case_id": "case-closing",
+        "evaluation_id": "eval-closing",
+        "event_url": "http://autoeval.invalid/v1/events",
+    })
+    _wait_for(lambda: harness.started_gate.is_set(), "the run to reach the harness")
+    harness.gate.set()
+    _wait_for(lambda: any(e["final"] for e in events), "the closing report to arrive")
+
+    final = [e for e in events if e["final"]]
+    assert len(final) == 1, "exactly one report may close the case"
+    assert final[0]["evaluation_id"] == "eval-closing"
+    assert final[0]["case_id"] == "case-closing"
+    # The closing report is the last one, and it carries the run's own ending
+    # facts so the trace's root has an outcome rather than an empty close.
+    assert final[0] is events[-1]
+    assert final[0]["event"]["type"] == "run/end"
+    assert final[0]["event"]["data"]["final_response"] == "done"
+    assert final[0]["seq"] == max(e["seq"] for e in events)
