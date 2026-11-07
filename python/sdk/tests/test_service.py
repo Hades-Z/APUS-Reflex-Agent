@@ -548,3 +548,36 @@ def test_each_finished_event_is_reported_while_the_run_is_going() -> None:
     assert first["source_session_id"]
     assert isinstance(first["seq"], int)
     assert first["event"]["type"]
+
+
+def test_events_are_reported_under_the_evaluation_that_sent_the_case() -> None:
+    """The verdict arrives under the same id, so the events must use it too.
+
+    A per-run id would put this case's events and its score in two different
+    evaluations, and nothing downstream could join them.
+    """
+    harness = _FakeHarness()
+    events: list[dict[str, Any]] = []
+
+    class _Events:
+        def post(self, url: str, payload: dict[str, Any], timeout: float) -> None:
+            events.append({"url": url, **payload})
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(),
+        harness_factory=lambda _config: harness,
+        event_callback=_Events(),
+    )
+    service.start_run({
+        "instruction": "do it",
+        "case_id": "case-7",
+        "request_id": "job-1",
+        "evaluation_id": "eval-run-9",
+        "event_url": "http://autoeval.invalid/v1/events",
+        "run_user": "eval-user-9",
+    })
+    _wait_for(lambda: harness.started_gate.is_set(), "the run to reach the harness")
+    harness.gate.set()
+    _wait_for(lambda: events, "at least one event to be reported")
+
+    assert events[0]["evaluation_id"] == "eval-run-9"

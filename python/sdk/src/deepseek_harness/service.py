@@ -43,6 +43,10 @@ class _Run:
     # by. Empty means the caller did not ask to be told.
     callback_url: str = ""
     request_id: str = ""
+    # The evaluation this run's case belongs to. Its events and its verdict are
+    # reported under it, which is what lets a verdict find the trace the case
+    # wrote; a per-job id would separate the two.
+    evaluation_id: str = ""
     event_url: str = ""
     case_id: str = ""
     run_user: str = ""
@@ -301,6 +305,7 @@ class HarnessService:
             route=_route_key(self._config_for(route)),
             callback_url=callback_url,
             request_id=str(task.get("request_id") or ""),
+            evaluation_id=str(task.get("evaluation_id") or ""),
             event_url=_event_url_from_task(task),
             case_id=str(task.get("case_id") or task.get("task_id") or ""),
             run_user=str(task.get("run_user") or ""),
@@ -381,7 +386,7 @@ class HarnessService:
             return
         run.reported += 1
         body = {
-            "evaluation_id": run.request_id or run.run_id,
+            "evaluation_id": run.evaluation_id or run.request_id or run.run_id,
             "case_id": run.case_id,
             "source_session_id": str(payload.get("sessionId") or run.session_id),
             "seq": run.reported,
