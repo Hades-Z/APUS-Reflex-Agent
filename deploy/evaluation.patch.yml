@@ -26,7 +26,22 @@
             contextWindow: !!js 'Number(process.env.LLM_CONTEXT_WINDOW || 1048576)'
             maxTokens: !!js 'Number(process.env.LLM_MAX_TOKENS || 8192)'
 
+# A benchmark trial hands its work here, but the task's files live in a
+# container this process never touches. Running bash locally would answer
+# about the wrong filesystem, so every command is relayed to the service that
+# owns the task environment. Only one shell implementation may be loaded.
+- id: bash-sandbox
+  disabled: true
+
 - insert:
+    - id: bash-remote
+      name: /workspace/packages/shell/bash-remote/lib/index.js
+      config:
+        endpoint: !!js 'process.env.PIPELINE_EXEC_ENDPOINT?.trim()'
+        token: !!js 'process.env.PIPELINE_API_TOKEN?.trim()'
+        timeoutMs: !!js 'Number(process.env.PIPELINE_EXEC_TIMEOUT_MS || 600000)'
+        maxTimeoutMs: !!js 'Number(process.env.PIPELINE_EXEC_MAX_TIMEOUT_MS || 3600000)'
+
     # Jev decides; the harness records what it decided.
     - id: jev
       name: /workspace/packages/experimental/apus-dsh-jev-plugin/lib/index.js
