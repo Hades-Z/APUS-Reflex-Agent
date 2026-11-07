@@ -20,6 +20,7 @@ import math
 import os
 import threading
 import uuid
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -38,6 +39,16 @@ class _Run:
     # The harness instance this run was bound to. Cancellation must reach the
     # same instance, which is not necessarily the deployment's own route.
     route: tuple[str, ...] = ()
+    # Where this run reports its outcome, and the identity the caller knows it
+    # by. Empty means the caller did not ask to be told.
+    callback_url: str = ""
+    request_id: str = ""
+    event_url: str = ""
+    case_id: str = ""
+    run_user: str = ""
+    # How many events this run has reported, which is the source sequence the
+    # evaluator de-dupes and orders by.
+    reported: int = 0
     result: dict[str, Any] | None = None
     error: str | None = None
     # ``none`` → ``cancelling`` → ``cancelled`` | ``cancel-failed``. Only a
@@ -85,6 +96,40 @@ def _route_key(config: DeepSeekHarnessConfig) -> tuple[str, ...]:
         config.base_url or "",
         config.api_key or "",
     )
+
+
+def _callback_url_from_task(task: dict[str, Any]) -> str:
+    """Where this run reports its outcome, validated before the run starts.
+
+    A malformed URL must fail the submission: a run that only discovers its
+    callback is unusable at the end has already spent the whole task budget.
+    """
+    raw = task.get("callback_url")
+    if raw is None:
+        return ""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("task.callback_url must be a nonempty string")
+    url = raw.strip()
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("task.callback_url must be an http(s) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("task.callback_url must not carry credentials, a query or a fragment")
+    return url
+
+
+def _event_url_from_task(task: dict[str, Any]) -> str:
+    """Where this run reports its events, validated before it starts."""
+    raw = task.get("event_url")
+    if raw is None:
+        return ""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("task.event_url must be a nonempty string")
+    url = raw.strip()
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("task.event_url must be an http(s) URL")
+    return url
 
 
 def _route_from_task(task: dict[str, Any]) -> dict[str, str]:
@@ -141,8 +186,18 @@ class HarnessService:
         config: DeepSeekHarnessConfig,
         *,
         harness_factory: Callable[[DeepSeekHarnessConfig], Any] | None = None,
+        result_callback: Any = None,
+        event_callback: Any = None,
     ) -> None:
         self._config = config
+        # Where each finished event is reported. Separate from the result
+        # callback on purpose: a trace service that is down must not cost the
+        # caller the outcome the run actually produced.
+        self._event_callback = event_callback
+        # Where a finished run reports its outcome. The caller that submitted a
+        # task is not holding the connection open — a task can run for hours —
+        # so this callback is the only way it learns the run ended.
+        self._result_callback = result_callback
         # One harness per route, keyed by what actually selects the model. Two
         # runs naming the same route share it; a different route gets its own,
         # because the model is fixed when the runtime is initialized.
@@ -236,6 +291,7 @@ class HarnessService:
         ):
             raise ValueError("task.session_id must be a nonempty string")
         route = _route_from_task(task)
+        callback_url = _callback_url_from_task(task)
         run_id = uuid.uuid4().hex
         run = _Run(
             run_id=run_id,
@@ -243,6 +299,11 @@ class HarnessService:
             instruction=instruction,
             session_id=requested_session or f"session-{run_id}",
             route=_route_key(self._config_for(route)),
+            callback_url=callback_url,
+            request_id=str(task.get("request_id") or ""),
+            event_url=_event_url_from_task(task),
+            case_id=str(task.get("case_id") or task.get("task_id") or ""),
+            run_user=str(task.get("run_user") or ""),
         )
         with self._lock:
             self._runs[run_id] = run
@@ -258,11 +319,15 @@ class HarnessService:
                 harness = self._ensure_started(route)
                 if run.cancel_requested:
                     return
-                result = harness.run(
-                    instruction,
-                    session_id=run.session_id,
-                    before_deliver=_refuse_when_cancelled(run),
-                )
+                deliver = {"session_id": run.session_id, "before_deliver": _refuse_when_cancelled(run)}
+                if self._event_callback is not None and run.event_url:
+                    # Asked for only when this deployment reports events: a
+                    # harness that cannot deliver them is no reason to refuse
+                    # the run.
+                    deliver["on_notification"] = (
+                        lambda notification: self._report_event(run, notification)
+                    )
+                result = harness.run(instruction, **deliver)
                 completed = {
                     "final_response": result.final_response,
                     "finish_reason": result.finish_reason,
@@ -278,6 +343,7 @@ class HarnessService:
                     # a late completion must not overwrite it.
                     if not run.cancel_requested:
                         run.result = completed
+                self._report_result(run, "succeeded")
             except _RunCancelled:
                 # The cancellation landed before this prompt was written, so
                 # the run's state already reports it.
@@ -287,6 +353,7 @@ class HarnessService:
                 # of the cancellation, not a run failure to report.
                 if not run.cancel_requested:
                     run.error = f"{type(error).__name__}: {error}"
+                    self._report_result(run, "failed")
             finally:
                 # While a cancellation is in flight, only its own path publishes
                 # the terminal state; otherwise the run would read as cancelled
@@ -297,6 +364,65 @@ class HarnessService:
 
         threading.Thread(target=execute, name=f"run-{run_id}", daemon=True).start()
         return run_id
+
+    def _report_event(self, run: _Run, notification: Any) -> None:
+        """Report one finished event to the evaluator, without blocking the run.
+
+        The SDK delivers notifications on the turn's own thread; a slow or
+        unreachable trace service must never hold up the model loop, so a
+        delivery failure is reported and dropped rather than raised into it.
+        """
+        callback = self._event_callback
+        if callback is None or not run.event_url:
+            return
+        payload = notification.payload if isinstance(getattr(notification, "payload", None), dict) else {}
+        event = payload.get("event")
+        if not isinstance(event, dict):
+            return
+        run.reported += 1
+        body = {
+            "evaluation_id": run.request_id or run.run_id,
+            "case_id": run.case_id,
+            "source_session_id": str(payload.get("sessionId") or run.session_id),
+            "seq": run.reported,
+            "first_seq": 1,
+            "final": False,
+            "question": run.instruction,
+            "run_user": run.run_user,
+            "event": event,
+        }
+        try:
+            callback.post(
+                run.event_url, body,
+                timeout=float(os.environ.get("DSH_EVENT_TIMEOUT_SEC", "5")),
+            )
+        except Exception as error:  # noqa: BLE001 - the run must keep going
+            print(f"[dsh-service] event report failed for {run.run_id}: {error}", flush=True)
+
+    def _report_result(self, run: _Run, status: str) -> None:
+        """Tell the submitting caller how this run ended.
+
+        A callback that cannot be delivered leaves the outcome in this
+        service's own record: the run is complete either way, and losing the
+        notification must not lose what it computed.
+        """
+        callback = self._result_callback
+        url = run.callback_url
+        if callback is None or not url:
+            return
+        payload = {
+            "run_id": run.run_id,
+            "request_id": run.request_id,
+            "status": status,
+            "session_id": run.session_id,
+            "task_id": run.task_id,
+            "result": run.result,
+            "error": run.error,
+        }
+        try:
+            callback.post(url, payload, timeout=float(os.environ.get("DSH_CALLBACK_TIMEOUT_SEC", "10")))
+        except Exception as error:  # noqa: BLE001 - the run already ended
+            print(f"[dsh-service] result callback failed for {run.run_id}: {error}", flush=True)
 
     def run_state(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:

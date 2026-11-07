@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Any
 from dataclasses import dataclass
 
 import pytest
@@ -42,13 +43,20 @@ class _FakeHarness:
         *,
         session_id: str | None = None,
         before_deliver=None,
+        on_notification=None,
     ) -> RunResult:
         if before_deliver is not None:
             before_deliver()
         self.prompts.append((instruction, session_id or ""))
         self.started_gate.set()
         self.gate.wait(timeout=5)
-        notifications = [Notification(method="session.status", payload={"status": "idle"})]
+        notifications = [
+            Notification(method="session.event", payload={"sessionId": session_id or "", "event": {"type": "turn/start", "seq": 1, "time": 1, "data": {"turn": 1}}}),
+            Notification(method="session.status", payload={"status": "idle"}),
+        ]
+        if on_notification is not None:
+            for notification in notifications:
+                on_notification(notification)
         return _FakeResult(
             final_response="done",
             finish_reason="completed",
@@ -469,3 +477,74 @@ def test_closing_twice_is_harmless() -> None:
     _wait_for(lambda: service.run_state(run_id)["status"] == "completed", "run")
     service.close()
     service.close()
+
+def test_a_finished_run_reports_its_outcome_to_the_caller_named_endpoint() -> None:
+    """The evaluator is told the result; it does not poll for it.
+
+    A task can run for hours, so the HTTP request that submitted it returns as
+    soon as the run is accepted. The outcome then reaches the caller through the
+    callback it named, which is the only way it learns the run finished.
+    """
+    harness = _FakeHarness()
+    service = _service(harness)
+    delivered: list[dict[str, Any]] = []
+
+    class _Sink:
+        def post(self, url: str, payload: dict[str, Any], timeout: float) -> None:
+            delivered.append({"url": url, **payload})
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(),
+        harness_factory=lambda _config: harness,
+        result_callback=_Sink(),
+    )
+    service.start_run({
+        "instruction": "do it",
+        "request_id": "req-1",
+        "callback_url": "http://benchmark.invalid/v1/jobs/job-1/backend-result",
+    })
+    # The fake harness holds the turn open until released, as a real one does.
+    _wait_for(lambda: harness.started_gate.is_set(), "the run to reach the harness")
+    harness.gate.set()
+    _wait_for(lambda: delivered, "the finished run to report back")
+
+    assert delivered[0]["url"].endswith("/backend-result")
+    assert delivered[0]["request_id"] == "req-1"
+    assert delivered[0]["status"] == "succeeded"
+
+
+def test_each_finished_event_is_reported_while_the_run_is_going() -> None:
+    """Events reach the evaluator as they happen, not only when the run ends.
+
+    A trace written once at the end shows nothing while a long task runs, and
+    nothing at all if it is cancelled first. The events are the run's own
+    notifications — the same ones a locally driven run records.
+    """
+    harness = _FakeHarness()
+    events: list[dict[str, Any]] = []
+
+    class _Events:
+        def post(self, url: str, payload: dict[str, Any], timeout: float) -> None:
+            events.append({"url": url, **payload})
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(),
+        harness_factory=lambda _config: harness,
+        event_callback=_Events(),
+    )
+    service.start_run({
+        "instruction": "do it",
+        "case_id": "case-7",
+        "event_url": "http://autoeval.invalid/v1/events",
+        "run_user": "eval-user-9",
+    })
+    _wait_for(lambda: harness.started_gate.is_set(), "the run to reach the harness")
+    harness.gate.set()
+    _wait_for(lambda: events, "at least one event to be reported")
+
+    first = events[0]
+    assert first["url"].endswith("/v1/events")
+    assert first["case_id"] == "case-7"
+    assert first["source_session_id"]
+    assert isinstance(first["seq"], int)
+    assert first["event"]["type"]
