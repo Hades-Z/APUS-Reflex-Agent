@@ -357,12 +357,16 @@ class HarnessService:
                 self._report_result(run, "succeeded")
             except _RunCancelled:
                 # The cancellation landed before this prompt was written, so
-                # the run's state already reports it.
-                pass
+                # the run's state already reports it. The trace still has to be
+                # closed: the receiver exports a case only once a report says
+                # it is over, and a cancelled case is over.
+                self._report_run_end(run, "cancelled")
             except Exception as error:
                 # A cancelled run's own abort error is the expected consequence
                 # of the cancellation, not a run failure to report.
-                if not run.cancel_requested:
+                if run.cancel_requested:
+                    self._report_run_end(run, "cancelled")
+                else:
                     run.error = f"{type(error).__name__}: {error}"
                     self._report_run_end(run, "failed")
                     self._report_result(run, "failed")
@@ -382,8 +386,8 @@ class HarnessService:
 
         The SDK delivers notifications on the turn's own thread; a slow or
         unreachable trace service must never hold up the model loop, so a
-        delivery failure is retried on the next event and then dropped rather
-        than raised into it.
+        delivery failure is kept for the next report to retry rather than
+        raised into it.
 
         The sequence number is the receiver's ordering key, and it writes only
         a contiguous run of events. Consuming a number for an event that never

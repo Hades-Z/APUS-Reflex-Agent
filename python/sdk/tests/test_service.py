@@ -37,6 +37,9 @@ class _FakeHarness:
         # that needs several events replaces them; the default is one event and
         # one status, which is what a one-step turn produces.
         self.notifications: list[Notification] | None = None
+        # An exception the run raises instead of returning, which is how a
+        # cancelled run surfaces: the harness aborts the turn.
+        self.fail_with: BaseException | None = None
 
     def start(self) -> None:
         self.started += 1
@@ -54,6 +57,8 @@ class _FakeHarness:
         self.prompts.append((instruction, session_id or ""))
         self.started_gate.set()
         self.gate.wait(timeout=5)
+        if self.fail_with is not None:
+            raise self.fail_with
         notifications = self.notifications or [
             Notification(method="session.event", payload={"sessionId": session_id or "", "event": {"type": "turn/start", "seq": 1, "time": 1, "data": {"turn": 1}}}),
             Notification(method="session.status", payload={"status": "idle"}),
@@ -675,3 +680,41 @@ def test_the_run_closes_its_trace_once_it_has_ended() -> None:
     assert final[0]["event"]["type"] == "run/end"
     assert final[0]["event"]["data"]["final_response"] == "done"
     assert final[0]["seq"] == max(e["seq"] for e in events)
+
+
+def test_a_cancelled_run_still_closes_its_trace() -> None:
+    """A cancelled case left its trace open, so nothing was ever exported.
+
+    Cases are cancelled in normal operation — a task that overruns its limit
+    is stopped — and the receiver keeps a trace open until a report says the
+    case is over. The closing report must arrive on this path too.
+    """
+    from deepseek_harness.service import _RunCancelled
+
+    harness = _FakeHarness()
+    harness.fail_with = _RunCancelled()
+    events: list[dict[str, Any]] = []
+
+    class _Events:
+        def post(self, url: str, payload: dict[str, Any], timeout: float) -> None:
+            events.append({"url": url, **payload})
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(),
+        harness_factory=lambda _config: harness,
+        event_callback=_Events(),
+    )
+    service.start_run({
+        "instruction": "do it",
+        "case_id": "case-cancelled",
+        "evaluation_id": "eval-cancelled",
+        "event_url": "http://autoeval.invalid/v1/events",
+    })
+    _wait_for(lambda: harness.started_gate.is_set(), "the run to reach the harness")
+    harness.gate.set()
+    _wait_for(lambda: events and any(e["final"] for e in events), "the closing report")
+
+    final = [e for e in events if e["final"]][0]
+    assert final["case_id"] == "case-cancelled"
+    assert final["event"]["type"] == "run/end"
+    assert final["event"]["data"]["status"] == "cancelled"
