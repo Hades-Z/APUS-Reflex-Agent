@@ -1,123 +1,70 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { createServer, type Server } from 'node:http'
 import { Context } from '@deepseek-ai/cordis'
+import { RemoteSubprocessRuntime } from '@deepseek-ai/dsh-subprocess-remote'
 import { RemoteBashExecutor } from '../src/index.ts'
+import { processService } from '../../../subprocess/subprocess-remote/tests/process-service.ts'
 
-/**
- * The task environment is not in this process: a benchmark service owns it
- * and runs commands there. These tests pin the wire contract — which command
- * is sent, where, and how the real output comes back — against a real HTTP
- * server rather than a stubbed client, because the endpoint and the request
- * are what the other side must agree with.
- */
-interface Received {
-  path: string
-  authorization: string | undefined
-  body: Record<string, unknown>
-}
+const cleanup: Array<() => Promise<void>> = []
+afterEach(async () => { for (const stop of cleanup.splice(0).reverse()) await stop() })
 
-const servers: Server[] = []
-
-afterEach(async () => {
-  await Promise.all(servers.splice(0).map(server => new Promise<void>((resolve) => {
-    server.close(() => resolve())
-  })))
-})
-
-async function service(answer: (received: Received) => { status: number; body: unknown }): Promise<{ endpoint: string; seen: Received[] }> {
-  const seen: Received[] = []
-  const server = createServer((request, response) => {
-    const chunks: Buffer[] = []
-    request.on('data', (chunk: Buffer) => chunks.push(chunk))
-    request.on('end', () => {
-      const received: Received = {
-        path: request.url ?? '',
-        authorization: request.headers.authorization,
-        body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>,
-      }
-      seen.push(received)
-      const { status, body } = answer(received)
-      response.writeHead(status, { 'Content-Type': 'application/json' })
-      response.end(JSON.stringify(body))
-    })
-  })
-  servers.push(server)
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
-  const address = server.address()
-  if (address === null || typeof address === 'string') throw new Error('no port')
-  return { endpoint: `http://127.0.0.1:${address.port}`, seen }
-}
-
-async function executorFor(endpoint: string, token?: string): Promise<RemoteBashExecutor> {
+async function fixture() {
+  const service = await processService()
+  cleanup.push(() => service.close())
   const ctx = new Context()
-  await ctx.plugin(RemoteBashExecutor, {
-    endpoint,
-    ...token === undefined ? {} : { token },
-    timeoutMs: 5_000,
-    maxTimeoutMs: 10_000,
+  cleanup.push(() => ctx.fiber.dispose())
+  await ctx.plugin(RemoteSubprocessRuntime, {
+    endpoint: service.endpoint, pollIntervalMs: 5, requestTimeoutMs: 500, maxRecoveryMs: 1000,
   })
-  return ctx.shell as RemoteBashExecutor
+  await ctx.plugin(RemoteBashExecutor, { cwd: process.cwd(), timeoutMs: 1000, maxTimeoutMs: 5000, graceMs: 100 })
+  return { service, ctx, bash: ctx.shell as RemoteBashExecutor }
 }
 
-describe('remote bash executor', () => {
-  it('runs the command in the environment the service owns', async () => {
-    const { endpoint, seen } = await service(() => ({
-      status: 200,
-      body: { stdout: 'task-file.txt\n', stderr: '', return_code: 0 },
+describe.skipIf(process.platform === 'win32')('remote Bash over native execution handles', () => {
+  it('keeps complete stdout, stderr and a nonzero command exit', async () => {
+    const { bash, service } = await fixture()
+    const execution = await bash.execute(bash.resolve({ command: 'printf out; printf err >&2; exit 3', agentId: 'case-shell' }))
+    const result = await execution.result()
+    expect(result.exitCode).toBe(3)
+    expect(result.stdout.text).toBe('out')
+    expect(result.stderr.text).toBe('err')
+    expect(service.requests.filter(r => r.body.op === 'spawn')).toHaveLength(1)
+    expect(service.requests[0]!.path).toBe('/jobs/by-session/case-shell/process')
+  })
+
+  it('supports native background execution and a real kill handle', async () => {
+    const { bash } = await fixture()
+    const execution = await bash.execute(bash.resolve({
+      command: 'printf started; exec sleep 60', agentId: 'case-background', onExpiry: 'none',
     }))
-    const executor = await executorFor(endpoint)
-
-    const result = await (await executor.execute(executor.resolve({
-      command: 'ls', agentId: 'case-7', workdir: '/app',
-    }))).result()
-
-    expect(result.exitCode).toBe(0)
-    expect(result.stdout.text).toBe('task-file.txt\n')
-    // The service routes by the agent's session, and gets the command verbatim.
-    expect(seen[0]?.path).toBe('/jobs/by-session/case-7/exec')
-    expect(seen[0]?.body).toMatchObject({ command: 'ls', workdir: '/app' })
+    expect(execution.status).toBe('running')
+    expect(execution.kill()).toBe(true)
+    await execution.done
+    expect(execution.status).toBe('killed')
+    expect(execution.kill()).toBe(false)
+    expect((await execution.result()).aborted).toBe(false)
   })
 
-  it('sends the credential the service requires', async () => {
-    const { endpoint, seen } = await service(() => ({ status: 200, body: { stdout: '', return_code: 0 } }))
-    const executor = await executorFor(endpoint, 'service-token')
-
-    await (await executor.execute(executor.resolve({ command: 'ls', agentId: 'case-1' }))).result()
-
-    expect(seen[0]?.authorization).toBe('Bearer service-token')
-  })
-
-  it('refuses a request that names no agent instead of guessing an environment', async () => {
-    const { endpoint, seen } = await service(() => ({ status: 200, body: { stdout: '', return_code: 0 } }))
-    const executor = await executorFor(endpoint)
-
-    await expect(executor.execute(executor.resolve({ command: 'ls' }))).rejects.toThrow(/names no agent/)
-
-    // Nothing was sent: a wrong environment would run against the wrong task.
-    expect(seen).toEqual([])
-  })
-
-  it('surfaces a service failure instead of reporting success', async () => {
-    const { endpoint } = await service(() => ({ status: 503, body: { error: 'channel gone' } }))
-    const executor = await executorFor(endpoint)
-
-    await expect(
-      executor.execute(executor.resolve({ command: 'ls', agentId: 'case-1' })),
-    ).rejects.toThrow(/503/)
-  })
-
-  it('keeps a non-zero exit code as the command outcome', async () => {
-    const { endpoint } = await service(() => ({
-      status: 200,
-      body: { stdout: '', stderr: 'no such file', return_code: 2 },
+  it('retains caller timeout classification instead of timing out a whole task', async () => {
+    const { bash } = await fixture()
+    const execution = await bash.execute(bash.resolve({
+      command: 'exec sleep 60', agentId: 'case-timeout', timeoutMs: 30,
     }))
-    const executor = await executorFor(endpoint)
+    const result = await execution.result()
+    expect(result.timedOut).toBe(true)
+    expect(result.aborted).toBe(false)
+  })
 
-    const result = await (await executor.execute(executor.resolve({
-      command: 'cat missing', agentId: 'case-1',
-    }))).result()
+  it('passes explicit environment and batch stdin through the native executor', async () => {
+    const { bash } = await fixture()
+    const execution = await bash.execute(bash.resolve({
+      command: 'cat; printf "$REMOTE_TEST"', agentId: 'case-input', stdin: 'hello ', env: { REMOTE_TEST: '中文🙂' },
+    }))
+    expect((await execution.result()).stdout.text).toBe('hello 中文🙂')
+  })
 
-    expect(result.exitCode).toBe(2)
-    expect(result.stderr.text).toBe('no such file')
+  it('requires the owning agent before resolving a command', async () => {
+    const { bash, service } = await fixture()
+    expect(() => bash.resolve({ command: 'pwd' })).toThrow(/names no agent/)
+    expect(service.requests).toEqual([])
   })
 })

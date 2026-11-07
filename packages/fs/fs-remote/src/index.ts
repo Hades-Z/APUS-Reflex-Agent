@@ -1,24 +1,9 @@
-/**
- * Filesystem provider whose execution world is the task container a benchmark
- * owns.
- *
- * A benchmark trial hands its work to this harness, but the files it asks
- * about — the repository being fixed, the data being parsed — live in a
- * container this process never touches. A local provider would answer about
- * the harness's own filesystem, so every operation is sent to the service
- * that owns the task and its real answer comes back.
- *
- * The target key carries the agent as well as the path: one harness process
- * serves several concurrent cases, and the service needs that identity to
- * tell which container a path belongs to. Consumers treat the key as opaque,
- * which is what makes it a safe place to keep it.
- *
- * @module @deepseek-ai/dsh-fs-remote
- */
+/** Remote filesystem operations addressed by the owning agent session. @module @deepseek-ai/dsh-fs-remote */
 
 import { posix } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { FileSystem, FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs'
 import type {
@@ -66,6 +51,78 @@ function encode(agentId: string, path: string): string {
   return `${agentId}\u0000${path}`
 }
 
+function rootSession(ctx: Context, agentId: string): string {
+  const sessions = ctx.get('sessions')
+  const seen = new Set<string>()
+  let current = SessionId(agentId)
+  while (sessions !== undefined) {
+    if (seen.has(current)) throw new FsError('session parent chain contains a cycle', 'FS_IO_ERROR')
+    seen.add(current)
+    const parent = sessions.get(current)?.header.parentSession
+    if (parent === undefined) break
+    current = parent
+  }
+  return current
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function checkedAnswer(value: unknown, request: ProbeRequest): ProbeAnswer {
+  const invalid = () => new FsError('filesystem probe returned invalid data', 'FS_IO_ERROR')
+  if (!record(value)) throw invalid()
+  if (value.ok === false) {
+    if (typeof value.code !== 'string' || !Object.hasOwn(ERROR_CODES, value.code) || typeof value.message !== 'string') throw invalid()
+    throw new FsError(value.message, value.code as FsErrorCode)
+  }
+  if (value.ok !== true) throw invalid()
+  const version = () => typeof value.version === 'string' && value.version.length > 0
+  switch (request.op) {
+    case 'resolve':
+      if (typeof value.path !== 'string' || !posix.isAbsolute(value.path)) throw invalid()
+      break
+    case 'stat':
+    case 'lstat':
+      if (value.exists !== false && (
+        value.exists !== true || !version() || typeof value.type !== 'string'
+        || !['file', 'directory', 'other', ...request.op === 'lstat' ? ['symlink'] : []].includes(value.type)
+        || !Number.isSafeInteger(value.size) || Number(value.size) < 0
+      )) throw invalid()
+      break
+    case 'read':
+      if (typeof value.text !== 'string') throw invalid()
+      break
+    case 'bytes':
+    case 'range': {
+      if (typeof value.base64 !== 'string') throw invalid()
+      const decoded = Buffer.from(value.base64, 'base64')
+      if (decoded.toString('base64') !== value.base64) throw invalid()
+      const limit = request.op === 'bytes' ? request.maxBytes : request.length
+      if (limit === undefined || decoded.byteLength > limit) throw invalid()
+      break
+    }
+    case 'list':
+      if (!Array.isArray(value.entries) || !value.entries.every(entry => record(entry)
+        && typeof entry.name === 'string' && entry.name.length > 0 && entry.name !== '.' && entry.name !== '..'
+        && !entry.name.includes('/') && typeof entry.path === 'string' && posix.isAbsolute(entry.path)
+        && typeof entry.type === 'string' && ['file', 'directory', 'other'].includes(entry.type)
+        && typeof entry.version === 'string'
+        && (entry.size === undefined || (Number.isSafeInteger(entry.size) && Number(entry.size) >= 0)),
+      )) throw invalid()
+      break
+    case 'write':
+      if (!version() || !['create', 'update'].includes(String(value.operation))
+        || !(value.before === null || typeof value.before === 'string') || typeof value.after !== 'string') throw invalid()
+      break
+    case 'edit':
+      if (!version() || typeof value.before !== 'string' || typeof value.after !== 'string') throw invalid()
+      break
+  }
+  return value as ProbeAnswer
+}
+
+/** Filesystem provider that runs every operation in the task container its request names. */
 export class RemoteFileSystem extends FileSystem {
   static Config = z.object({
     endpoint: z.string().required(),
@@ -125,25 +182,27 @@ export class RemoteFileSystem extends FileSystem {
     if (answer.exists === false) return undefined
     return {
       version: FsVersion(String(answer.version ?? '')),
-      type: answer.type ?? 'other',
+      type: answer.type === 'symlink' ? 'other' : answer.type ?? 'other',
       ...typeof answer.size === 'number' ? { size: answer.size } : {},
     }
   }
 
   override async lstat(
-    path: string, opts?: { cwd?: string }, signal?: AbortSignal,
+    path: string, opts?: { cwd?: string; agentId?: string }, signal?: AbortSignal,
   ): Promise<FsPathInfo | undefined> {
-    // lstat is path-shaped, so it carries no agent. One process serves several
-    // cases, and guessing which container a bare path belongs to would answer
-    // about the wrong task; the callers that need it are UI and persistence
-    // paths that never run against a task environment.
-    void path
-    void opts
-    signal?.throwIfAborted()
-    throw new FsError(
-      'a path alone does not say which task container it belongs to',
-      'FS_IO_ERROR',
+    const agentId = opts?.agentId
+    if (agentId === undefined) throw new FsError('the request names no agent', 'FS_IO_ERROR')
+    const answer = await this._call(
+      agentId,
+      { op: 'lstat', path, ...opts?.cwd === undefined ? {} : { cwd: opts.cwd } },
+      signal,
     )
+    if (answer.exists === false) return undefined
+    return {
+      version: FsVersion(String(answer.version ?? '')),
+      type: answer.type ?? 'other',
+      ...typeof answer.size === 'number' ? { size: answer.size } : {},
+    }
   }
 
   override async readText(target: FsTarget, signal?: AbortSignal): Promise<string> {
@@ -153,14 +212,32 @@ export class RemoteFileSystem extends FileSystem {
   }
 
   override async streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>> {
-    // The whole text arrives in one answer; yielding it in chunks keeps the
-    // caller's interface identical without a second protocol.
-    const text = await this.readText(target, signal)
+    const info = await this.stat(target, signal)
+    if (info === undefined) throw new FsError('file not found', 'FS_NOT_FOUND')
+    if (info.type !== 'file') throw new FsError('not a regular file', 'FS_NOT_REGULAR_FILE')
+    const { agentId, path } = decode(target)
+    const readRange = (offset: number) => this._call(agentId, {
+      op: 'range', path, offset, length: 65_536, expectedVersion: String(info.version),
+    }, signal)
     return (async function* () {
-      const chunk = 64 * 1024
-      for (let at = 0; at < text.length; at += chunk) {
-        signal?.throwIfAborted()
-        yield text.slice(at, at + chunk)
+      const decoder = new TextDecoder('utf-8', { fatal: true })
+      let offset = 0
+      while (true) {
+        if (signal?.aborted) throw new FsError('read aborted', 'FS_ABORTED')
+        const answer = await readRange(offset)
+        const bytes = Buffer.from(String(answer.base64), 'base64')
+        if (offset < 8192 && bytes.subarray(0, 8192 - offset).includes(0)) {
+          throw new FsError('binary file', 'FS_NOT_TEXT')
+        }
+        let text: string
+        try {
+          text = bytes.length === 0 ? decoder.decode() : decoder.decode(bytes, { stream: true })
+        } catch (error) {
+          throw new FsError('not UTF-8 text', 'FS_NOT_TEXT', { cause: error })
+        }
+        if (text.length > 0) yield text
+        if (bytes.length === 0) return
+        offset += bytes.length
       }
     })()
   }
@@ -190,8 +267,8 @@ export class RemoteFileSystem extends FileSystem {
       name: entry.name,
       type: entry.type,
       target: {
-        targetKey: FsTargetKey(encode(agentId, posix.join(path, entry.name))),
-        displayPath: posix.join(path, entry.name),
+        targetKey: FsTargetKey(encode(agentId, entry.path)),
+        displayPath: entry.path,
       },
       ...entry.version ? { version: FsVersion(entry.version) } : {},
       ...typeof entry.size === 'number' ? { size: entry.size } : {},
@@ -202,10 +279,10 @@ export class RemoteFileSystem extends FileSystem {
     target: FsTarget, content: string, expected?: FsWriteIntent,
     signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsWriteOutcome> {
-    void sandboxPolicy
     const { agentId, path } = decode(target)
     const request: ProbeRequest = {
       op: 'write', path, content,
+      ...sandboxPolicy === undefined ? {} : { policy: sandboxPolicy },
       ...expected?.kind === 'createIfAbsent' ? { createOnly: true } : {},
       ...expected?.kind === 'replaceIfVersion' ? { expectedVersion: String(expected.version) } : {},
     }
@@ -222,10 +299,10 @@ export class RemoteFileSystem extends FileSystem {
     target: FsTarget, edit: FsEditRequest, expected?: { version: FsVersion },
     signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsEditOutcome> {
-    void sandboxPolicy
     const { agentId, path } = decode(target)
     const request: ProbeRequest = {
       op: 'edit', path,
+      ...sandboxPolicy === undefined ? {} : { policy: sandboxPolicy },
       old: edit.oldString, new: edit.newString, replaceAll: edit.replaceAll,
       ...expected === undefined ? {} : { expectedVersion: String(expected.version) },
     }
@@ -237,63 +314,44 @@ export class RemoteFileSystem extends FileSystem {
     }
   }
 
-  /**
-   * Run one probe in the task container and return its answer.
-   *
-   * A failure the caller can act on arrives as a code inside a successful
-   * answer; a service that could not run the probe at all throws, because a
-   * container that never answered is not the same fact as a missing file.
-   */
+  /** Execute one probe without retrying a possibly committed mutation. */
   private async _call(
     agentId: string, request: ProbeRequest, signal?: AbortSignal,
   ): Promise<ProbeAnswer> {
-    if (!agentId) {
-      throw new FsError('the request names no agent', 'FS_IO_ERROR')
-    }
+    if (signal?.aborted) throw new FsError('filesystem operation aborted', 'FS_ABORTED')
+    if (!agentId) throw new FsError('the request names no agent', 'FS_IO_ERROR')
     const service = this.config.endpoint.replace(/\/$/, '')
-    const response = await fetch(
-      `${service}/jobs/by-session/${encodeURIComponent(agentId)}/exec`,
-      {
+    const token = this.config.token?.trim()
+    const owner = rootSession(this.ctx, agentId)
+    try {
+      const response = await fetch(`${service}/jobs/by-session/${encodeURIComponent(owner)}/exec`, {
         method: 'POST',
+        redirect: 'error',
         headers: {
           'Content-Type': 'application/json',
-          ...this.config.token === undefined ? {} : { Authorization: `Bearer ${this.config.token}` },
+          ...token ? { Authorization: `Bearer ${token}` } : {},
         },
-        body: JSON.stringify({
-          command: probeCommand(request),
-          timeout_sec: this.config.timeoutSec,
-        }),
-        ...signal === undefined ? {} : { signal },
-      },
-    )
-    if (!response.ok) {
-      const detail = await response.text()
-      throw new FsError(
-        `the task service answered ${response.status}: ${detail.slice(0, 500)}`,
-        'FS_IO_ERROR',
-      )
+        body: JSON.stringify({ command: probeCommand(request), timeout_sec: this.config.timeoutSec }),
+        signal: AbortSignal.any([
+          AbortSignal.timeout(Math.ceil(this.config.timeoutSec * 1000)),
+          ...signal === undefined ? [] : [signal],
+        ]),
+      })
+      if (!response.ok) throw new FsError(`the task service answered ${response.status}`, 'FS_IO_ERROR')
+      const body: unknown = await response.json()
+      if (!record(body) || body.return_code !== 0 || body.refused === true
+        || (body.refused !== undefined && typeof body.refused !== 'boolean') || typeof body.stdout !== 'string') {
+        throw new FsError('the task service did not complete the filesystem probe', 'FS_IO_ERROR')
+      }
+      if (signal?.aborted) throw new FsError('filesystem operation aborted', 'FS_ABORTED')
+      return checkedAnswer(JSON.parse(body.stdout), request)
+    } catch (error) {
+      if (signal?.aborted) throw new FsError('filesystem operation aborted', 'FS_ABORTED', { cause: error })
+      if (error instanceof FsError) throw error
+      throw new FsError('filesystem request failed or returned invalid data', 'FS_IO_ERROR', { cause: error })
     }
-    const body: unknown = await response.json()
-    const stdout = typeof body === 'object' && body !== null
-      ? (body as { stdout?: unknown }).stdout
-      : undefined
-    if (typeof stdout !== 'string') {
-      throw new FsError('the task service answered no output', 'FS_IO_ERROR')
-    }
-    let answer: ProbeAnswer
-    try {
-      answer = JSON.parse(stdout.trim().split('\n').pop() ?? '{}') as ProbeAnswer
-    } catch {
-      throw new FsError(`the probe answered unreadable output: ${stdout.slice(0, 300)}`, 'FS_IO_ERROR')
-    }
-    if (answer.ok === false) {
-      const code = answer.code !== undefined && Object.hasOwn(ERROR_CODES, answer.code)
-        ? answer.code as FsErrorCode
-        : 'FS_IO_ERROR'
-      throw new FsError(answer.message ?? 'filesystem operation failed', code)
-    }
-    return answer
   }
+
 }
 
 export default RemoteFileSystem

@@ -1,5 +1,5 @@
 ---
-description: "Subprocess runtime for deployments whose task environment lives in another container, for maintainers whose tools spawn commands."
+description: "Task-container process handles for session-scoped command consumers and their maintainers."
 kind: "package-reference"
 ---
 
@@ -7,52 +7,78 @@ kind: "package-reference"
 
 ## Summary
 
-`dsh-subprocess-remote` serves `ctx.subprocess` from the environment a benchmark service owns. Some tools are spawn-backed rather than filesystem-provider methods — `glob` and `grep` run `ripgrep` through this seam — so with a local runtime they search the harness's own filesystem and report "no such directory" for a path the task provides.
-
-Every spawn is one command with a complete answer, so the handle is already settled. Pretending otherwise would let a caller wait for output that will never grow.
+`dsh-subprocess-remote` provides live `ctx.subprocess` handles for commands executed by a Benchmark task process worker. It sends one spawn request with a stable call id, reads bounded output windows by absolute byte offset, and addresses termination and stdin updates to that same id. Lost acknowledgements never cause another spawn.
 
 ## Table of Contents
 
 - [Use this package](#use-this-package)
-- [Understand the implementation](#understand-the-implementation)
+- [Process and output lifecycle](#process-and-output-lifecycle)
+- [Model Experience](#model-experience)
 - [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
 
------
-
-<a id="use-this-package"></a>
 ## Use this package
 
-Mount this runtime in place of the local one when spawned commands must run where the task lives.
+Mount this provider in the task Agent's isolated subprocess context. Keep Harness-owned services on their original local provider. A command requires `spec.agentId`; when a SessionStore is present, its native parent-session chain selects the root task route without changing the source identity.
 
 ```yaml
-- id: subprocess
-  disabled: true
-
-- id: subprocess-remote
+- id: task-processes
   name: '@deepseek-ai/dsh-subprocess-remote'
   config:
     endpoint: http://terminalbench-pipeline:8080
     token: !!js 'process.env.PIPELINE_API_TOKEN?.trim()'
+    pollIntervalMs: 250
+    requestTimeoutMs: 5000
+    maxRecoveryMs: 60000
+    maxReadBytes: 65536
+    pipeBufferBytes: 1048576
 ```
 
-| Field | Meaning |
+| Field | Purpose |
 |---|---|
-| `endpoint` | The service that owns the task containers. Required. |
-| `token` | Bearer credential, sent as `Authorization`. Optional. |
-| `timeoutSec` | Budget for one command. |
+| `endpoint` | Benchmark service hosting `/jobs/by-session/<root-session>/process`. |
+| `token` | Optional Bearer credential; never forwarded to a redirected target. |
+| `pollIntervalMs` | Delay between idle status/output reads. |
+| `requestTimeoutMs` | Budget for one transport request, not command execution. |
+| `maxRecoveryMs` | Bound for recovering a temporarily unavailable process record. |
+| `maxReadBytes` | Output window per stream; the protocol permits at most 1 MiB. |
+| `pipeBufferBytes` | Stream backpressure threshold and remote retention budget for pipe consumers. |
 
-<a id="understand-the-implementation"></a>
-## Understand the implementation
+## Process and output lifecycle
 
-The spec's `agentId` names which task container the command belongs to; a spec without one is refused before anything is sent, because guessing would run the command against another case's task.
+`done` settles after the worker reports the child's exit and its output has been drained. `waitForExit` separately requires `range_empty`: a child's exit does not establish that descendants are gone. `terminate`, caller cancellation and provider disposal all address the existing process; disposal awaits termination confirmation and releases owned streams.
 
-Argv is quoted for the container's shell one argument at a time, so a value containing a quote, a `$`, or a backtick reaches the program unchanged instead of being interpreted. The collected-output readers reflect the command's real streams once it answers.
+`stdin: { data }` supplies batch input, while `stdin: 'pipe'` returns a writable stream with monotonically numbered, retry-safe input messages. Output pipes carry raw bytes. Collection reuses the native bounded OutputCollector; its readers retain byte offsets, truncation information and the worker's real task-container spill path. A host-side cache path is never advertised as a task file. An unknown worker state or a gap in a piped byte stream is a provider failure, not command success.
 
-`terminalEnvironment` reports the container's platform and shell; `spawnTerminal` refuses, because this runtime has no terminal to allocate and returning a handle that could never carry input would be worse than saying so.
+Explicit environment entries travel to the worker; `undefined` is encoded as `null` to remove an ambient entry. The worker owns parent-environment credential scrubbing. Caller-owned signals and the Bash consumer own command deadlines.
 
-<a id="known-limitations-and-deferred-work"></a>
+## Model Experience
+
+### Task-environment process results
+
+#### What the model sees
+
+Native `Bash` and spawn-backed search consumers keep their result types while commands execute in the selected task environment. Bounded output retains the worker's recovery file when available rather than replacing the full output with an unexplained count.
+
+#### Token effect
+
+No model call or context is added; the native consumers keep their existing input and result budgets.
+
+#### KV Cache effect
+
+No direct invalidation; the native consumers own any request-prefix changes.
+
 ## Known Limitations and Deferred Work
 
-- **No live process.** A spawn completes with its whole output; there is no incremental read while it runs.
-- **No terminal.** Interactive programs cannot run through this runtime.
-- **A lost service is a failed command.** Nothing is retried: a command with side effects must not run twice.
+- The process protocol exposes stdin, stdout and stderr, but no PTY or separate control descriptor. These requests fail before a command starts rather than receiving an unusable handle.
+- Transport recovery is bounded. When the worker remains unknown, process outcome and cleanup remain unconfirmed; the provider reports that failure instead of restarting the command.
+- Watching processes that escape the worker-owned process range requires the execution service to provide stronger containment; the client cannot infer host-level quiescence from child exit.
+
+<a id="dev-note"></a>
+### Dev Note
+
+<details>
+<summary>Working context for maintainers — click to expand</summary>
+
+The worker owns process groups, byte offsets and output spill files inside the task container; the provider must never respawn a call id whose outcome it could not confirm.
+
+</details>

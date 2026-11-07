@@ -199,7 +199,9 @@ export abstract class FileSystem extends Service {
    * @param signal - aborts the metadata round-trip.
    * @returns metadata only, never content; undefined for an absent path.
    */
-  abstract lstat(path: string, opts?: { cwd?: string }, signal?: AbortSignal): Promise<FsPathInfo | undefined>
+  abstract lstat(
+    path: string, opts?: { cwd?: string; agentId?: string }, signal?: AbortSignal,
+  ): Promise<FsPathInfo | undefined>
 
   /**
    * Read the whole regular text file as a single decoded string.

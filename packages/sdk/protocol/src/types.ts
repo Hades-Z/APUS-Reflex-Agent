@@ -38,6 +38,10 @@ export interface SessionPromptParams {
   sessionId: string
   /** The prompt content blocks, sent verbatim as the user message. */
   contentBlocks: SdkPromptContentBlock[]
+  /** Session working directory; fixed on creation and independent of the runtime cwd. */
+  cwd?: string
+  /** Declared Agent composition to bind before publishing the session; fixed on creation. */
+  agentPreset?: string
 }
 
 /** Inline raster input admitted into the runtime's durable attachment store. */

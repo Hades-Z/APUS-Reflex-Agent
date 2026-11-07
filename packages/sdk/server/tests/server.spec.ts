@@ -109,6 +109,70 @@ async function settleSubagent(
 }
 
 describe('HarnessSdkJsonRpcServer', () => {
+  it('binds a requested preset before the first prompt and freezes it for the session', async () => {
+    const agents = new Map<string, Agent>()
+    const followups = new Map<string, number>()
+    const mount = vi.fn(async () => ({ id: 'benchmark-task' }))
+    const agentCtx = new Context()
+    const create = vi.fn(async (options: import('@deepseek-ai/dsh-agent').CreateAgentOptions) => {
+      const agent = Object.assign({} as Agent, {
+        id: options.sessionId,
+        followup: () => { followups.set(String(options.sessionId), (followups.get(String(options.sessionId)) ?? 0) + 1) },
+      })
+      await options.setup?.(agentCtx, agent)
+      agents.set(String(options.sessionId), agent)
+      return { agent, dispose: async () => {} }
+    })
+    const ctx = new Context()
+    ctx.provide('agents', { create, get: (id: SessionId) => agents.get(String(id)) })
+    ctx.provide('agentPresets', { mount })
+    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+    Object.assign(server, { initialized: true })
+    const contentBlocks = [{ type: 'text' as const, text: 'inspect the task' }]
+    try {
+      await server.prompt({ sessionId: 'task', agentPreset: 'benchmark-task', contentBlocks })
+      expect(mount).toHaveBeenCalledWith(agentCtx, 'benchmark-task')
+      expect(create.mock.calls[0]?.[0].meta?.agentPreset).toBe('benchmark-task')
+      await server.prompt({ sessionId: 'task', contentBlocks })
+      await expect(server.prompt({ sessionId: 'task', agentPreset: 'another', contentBlocks })).rejects.toThrow(/preset/)
+      expect(create).toHaveBeenCalledOnce()
+      expect(followups.get('task')).toBe(2)
+    } finally {
+      await server.shutdown()
+      await agentCtx.fiber.dispose()
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('freezes a separate cwd for each SDK session before delivering prompts', async () => {
+    const agents = new Map<string, Agent>()
+    const followups = new Map<string, number>()
+    const create = vi.fn(async (options: { sessionId: SessionId; meta?: { cwd?: string } }) => {
+      const agent = Object.assign({} as Agent, {
+        id: options.sessionId,
+        followup: () => { followups.set(String(options.sessionId), (followups.get(String(options.sessionId)) ?? 0) + 1) },
+      })
+      agents.set(String(options.sessionId), agent)
+      return { agent, dispose: async () => {} }
+    })
+    const ctx = new Context()
+    ctx.provide('agents', { create, get: (id: SessionId) => agents.get(String(id)) })
+    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+    Object.assign(server, { initialized: true })
+    const contentBlocks = [{ type: 'text' as const, text: 'inspect the task' }]
+    try {
+      await server.prompt({ sessionId: 'task-a', cwd: '/app/task-a', contentBlocks })
+      await server.prompt({ sessionId: 'task-b', cwd: '/app/task-b', contentBlocks })
+      await server.prompt({ sessionId: 'task-a', contentBlocks })
+      expect(create.mock.calls.map(([options]) => options.meta?.cwd)).toEqual(['/app/task-a', '/app/task-b'])
+      await expect(server.prompt({ sessionId: 'task-a', cwd: '/app/another', contentBlocks })).rejects.toThrow(/cwd/)
+      expect(followups.get('task-a')).toBe(2)
+    } finally {
+      await server.shutdown()
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('creates a harness agent and calls the configured OpenAI-compatible endpoint', { timeout: 15_000 }, async () => {
     const storageDir = await mkdtemp(join(tmpdir(), 'dsh-jsonrpc-'))
     const llmServer = await mockCompletionServer()
@@ -1107,25 +1171,25 @@ describe('HarnessSdkJsonRpcServer', () => {
       get: () => undefined,
     } as unknown as Context
     const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport()) as unknown as {
-      getOrCreateSession(sessionId: string): Promise<{ handle: AgentHandle }>
+      getOrCreateSession(params: { sessionId: string; contentBlocks: [] }): Promise<{ handle: AgentHandle }>
       shutdown(): Promise<Record<string, never>>
     }
 
-    const first = server.getOrCreateSession('shared')
-    const second = server.getOrCreateSession('shared')
+    const first = server.getOrCreateSession({ sessionId: 'shared', contentBlocks: [] })
+    const second = server.getOrCreateSession({ sessionId: 'shared', contentBlocks: [] })
     expect(create).toHaveBeenCalledTimes(1)
     resolveShared?.(sharedHandle)
     const [firstRecord, secondRecord] = await Promise.all([first, second])
     expect(firstRecord).toBe(secondRecord)
 
-    await expect(server.getOrCreateSession('retry')).rejects.toThrow('creation failed')
-    await expect(server.getOrCreateSession('retry')).resolves.toMatchObject({ handle: retryHandle })
+    await expect(server.getOrCreateSession({ sessionId: 'retry', contentBlocks: [] })).rejects.toThrow('creation failed')
+    await expect(server.getOrCreateSession({ sessionId: 'retry', contentBlocks: [] })).resolves.toMatchObject({ handle: retryHandle })
     expect(create).toHaveBeenCalledTimes(3)
 
     await server.shutdown()
     expect(sharedHandle.dispose).toHaveBeenCalledOnce()
     expect(retryHandle.dispose).toHaveBeenCalledOnce()
-    await expect(server.getOrCreateSession('after-shutdown')).rejects.toThrow('SDK server is shutting down')
+    await expect(server.getOrCreateSession({ sessionId: 'after-shutdown', contentBlocks: [] })).rejects.toThrow('SDK server is shutting down')
   })
 
   it('resolves a relative cwd before creating the session', async () => {
@@ -1139,12 +1203,12 @@ describe('HarnessSdkJsonRpcServer', () => {
     } as unknown as Context
     const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport()) as unknown as {
       initialize(params: { cwd: string; provider: string; model: string; reasoningEffort?: string; maxTokens?: number }): Promise<unknown>
-      getOrCreateSession(sessionId: string): Promise<unknown>
+      getOrCreateSession(params: { sessionId: string; contentBlocks: [] }): Promise<unknown>
       shutdown(): Promise<Record<string, never>>
     }
 
     await server.initialize({ cwd: '.', provider: 'mock', model: 'model', reasoningEffort: 'high', maxTokens: 123 })
-    await server.getOrCreateSession('relative')
+    await server.getOrCreateSession({ sessionId: 'relative', contentBlocks: [] })
 
     expect(resolveCallConfig).toHaveBeenCalledWith({
       provider: 'mock',

@@ -214,6 +214,8 @@ class HarnessClient:
         session_id: str,
         content_blocks: list[JsonObject],
         *,
+        cwd: str | None = None,
+        agent_preset: str | None = None,
         on_notification: Callable[[Notification], None] | None = None,
         notification_subscription: "NotificationSubscription | None" = None,
         before_deliver: Callable[[], None] | None = None,
@@ -226,6 +228,10 @@ class HarnessClient:
         refuse work cancelled in the meantime.
         """
         payload: JsonObject = {"sessionId": session_id, "contentBlocks": content_blocks}
+        if cwd is not None:
+            payload["cwd"] = cwd
+        if agent_preset is not None:
+            payload["agentPreset"] = agent_preset
         with self._session_prompts_settled:
             self._session_prompts_in_flight[session_id] = (
                 self._session_prompts_in_flight.get(session_id, 0) + 1

@@ -17,6 +17,7 @@
         api: openai-completions
         baseURL: !!js 'process.env.LLM_BASE_URL?.trim()'
         apiKeyEnv: LLM_API_KEY
+        timeoutMs: !!js 'Number(process.env.LLM_REQUEST_TIMEOUT_MS || 900000)'
         models:
           - id: !!js 'process.env.LLM_MODEL?.trim()'
             name: !!js 'process.env.LLM_MODEL?.trim()'
@@ -26,45 +27,49 @@
             contextWindow: !!js 'Number(process.env.LLM_CONTEXT_WINDOW || 1048576)'
             maxTokens: !!js 'Number(process.env.LLM_MAX_TOKENS || 8192)'
 
-# A benchmark trial hands its work here, but the task's files live in a
-# container this process never touches. Running bash locally would answer
-# about the wrong filesystem, so every command is relayed to the service that
-# owns the task environment. Only one shell implementation may be loaded.
-- id: bash-sandbox
-  disabled: true
-
-# The same reason applies to files: `read`, `write`, `glob` and `grep` would
-# otherwise answer about this container instead of the task's.
-- id: fs-sandbox
-  disabled: true
-
-# `glob` and `grep` run ripgrep through the subprocess seam rather than the
-# filesystem provider, so that seam must reach the task container too.
-- id: subprocess
-  disabled: true
-
 - insert:
-    - id: subprocess-remote
-      name: /workspace/packages/subprocess/subprocess-remote/lib/index.js
+    - id: agent-preset-registry
+      name: /workspace/packages/preset/agent-preset-registry/lib/index.js
       config:
-        endpoint: !!js 'process.env.PIPELINE_EXEC_ENDPOINT?.trim()'
-        token: !!js 'process.env.PIPELINE_API_TOKEN?.trim()'
-        timeoutSec: !!js 'Number(process.env.PIPELINE_SUBPROCESS_TIMEOUT_SEC || 600)'
+        default: benchmark-task
 
-    - id: fs-remote
-      name: /workspace/packages/fs/fs-remote/lib/index.js
+    - id: preset-benchmark-task
+      name: /workspace/packages/preset/agent-preset/lib/index.js
       config:
-        endpoint: !!js 'process.env.PIPELINE_EXEC_ENDPOINT?.trim()'
-        token: !!js 'process.env.PIPELINE_API_TOKEN?.trim()'
-        timeoutSec: !!js 'Number(process.env.PIPELINE_FS_TIMEOUT_SEC || 120)'
-
-    - id: bash-remote
-      name: /workspace/packages/shell/bash-remote/lib/index.js
-      config:
-        endpoint: !!js 'process.env.PIPELINE_EXEC_ENDPOINT?.trim()'
-        token: !!js 'process.env.PIPELINE_API_TOKEN?.trim()'
-        timeoutMs: !!js 'Number(process.env.PIPELINE_EXEC_TIMEOUT_MS || 600000)'
-        maxTimeoutMs: !!js 'Number(process.env.PIPELINE_EXEC_MAX_TIMEOUT_MS || 3600000)'
+        id: benchmark-task
+        plugins:
+          - id: benchmark-task-io
+            name: cordis:group
+            group: true
+            isolate:
+              fs: true
+              shell: true
+              subprocess: true
+            config:
+              - id: subprocess-remote
+                name: /workspace/packages/subprocess/subprocess-remote/lib/index.js
+                config:
+                  endpoint: !!js 'process.env.PIPELINE_EXEC_ENDPOINT?.trim()'
+                  token: !!js 'process.env.PIPELINE_API_TOKEN?.trim()'
+              - id: fs-remote
+                name: /workspace/packages/fs/fs-remote/lib/index.js
+                config:
+                  endpoint: !!js 'process.env.PIPELINE_EXEC_ENDPOINT?.trim()'
+                  token: !!js 'process.env.PIPELINE_API_TOKEN?.trim()'
+                  timeoutSec: !!js 'Number(process.env.PIPELINE_FS_TIMEOUT_SEC || 120)'
+              - id: bash-remote
+                name: /workspace/packages/shell/bash-remote/lib/index.js
+                config:
+                  timeoutMs: !!js 'Number(process.env.PIPELINE_EXEC_TIMEOUT_MS || 600000)'
+                  maxTimeoutMs: !!js 'Number(process.env.PIPELINE_EXEC_MAX_TIMEOUT_MS || 3600000)'
+              - id: tool-fs
+                name: '@deepseek-ai/dsh-tool-fs'
+              - id: tool-fs-search
+                name: '@deepseek-ai/dsh-tool-fs-search'
+                config:
+                  sampleOverCapGlobResults: false
+              - id: tool-bash
+                name: '@deepseek-ai/dsh-tool-bash'
 
     # Jev decides; the harness records what it decided.
     - id: jev

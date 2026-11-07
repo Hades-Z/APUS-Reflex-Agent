@@ -287,10 +287,14 @@ export class HarnessClient {
    * Queue one prompt and return its inbox identity without waiting for a storage flush.
    * @param sessionId - target session; an unknown id creates it.
    * @param contentBlocks - the user message, sent verbatim.
+   * @param options - optional working directory and agent preset for a newly created session.
    * @returns the queued message id.
    */
-  async prompt(sessionId: string, contentBlocks: SdkPromptContentBlock[]): Promise<string> {
-    const params: SessionPromptParams = { sessionId, contentBlocks }
+  async prompt(
+    sessionId: string, contentBlocks: SdkPromptContentBlock[],
+    options?: Pick<SessionPromptParams, 'cwd' | 'agentPreset'>,
+  ): Promise<string> {
+    const params: SessionPromptParams = { sessionId, contentBlocks, ...options }
     const result = await this.request('session/prompt', { ...params })
     if (!isRecord(result) || typeof result.messageId !== 'string') {
       throw new SdkProtocolError(`session/prompt returned no message id: ${JSON.stringify(result)}`)

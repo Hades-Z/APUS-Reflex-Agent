@@ -6,13 +6,14 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { resolve } from 'node:path'
+import { isAbsolute, resolve } from 'node:path'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, AgentSetup } from '@deepseek-ai/dsh-agent'
 import { admitEncodedImages, type EncodedImageAttachment, type ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage, ReasoningEffortId, type ContentBlock, type LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { carrierKeyOf, type Scoped } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import type SubagentRuntime from '@deepseek-ai/dsh-subagent'
 import type { SubagentRunEndInfo } from '@deepseek-ai/dsh-subagent'
 import * as LlmDeepSeek from '@deepseek-ai/dsh-llm-deepseek-api-key'
@@ -32,6 +33,8 @@ import type {
 
 interface SessionRecord {
   handle: AgentHandle
+  cwd: string
+  agentPreset: string | undefined
 }
 
 /** Validate the wire params of one `session/cancel` request. */
@@ -196,7 +199,7 @@ export class HarnessSdkJsonRpcServer {
     if (!this.initialized) throw new Error('SDK server is not initialized')
     // Snapshot before any await: this prompt owns the generation it arrived in.
     const generation = this.cancelGenerationOf(params.sessionId)
-    const rec = await this.getOrCreateSession(params.sessionId)
+    const rec = await this.getOrCreateSession(params)
     // An agent-loop-only reload disposes the loop's agents while this record
     // survives; a retained agent accepts followup() silently, so validate the
     // record against the live registry before delivery.
@@ -316,13 +319,20 @@ export class HarnessSdkJsonRpcServer {
     }
   }
 
-  private async getOrCreateSession(sessionId: string): Promise<SessionRecord> {
+  private async getOrCreateSession(params: SessionPromptParams): Promise<SessionRecord> {
     if (this.shuttingDown) throw new Error('SDK server is shutting down')
+    const { sessionId, cwd, agentPreset } = params
+    if (agentPreset !== undefined && (typeof agentPreset !== 'string' || agentPreset.trim() === '')) {
+      throw new TypeError('session agentPreset must be a nonempty string')
+    }
+    if (cwd !== undefined && (typeof cwd !== 'string' || !isAbsolute(cwd))) {
+      throw new TypeError('session cwd must be an absolute path')
+    }
     const existing = this.sessions.get(sessionId)
-    if (existing) return existing
+    if (existing !== undefined) return this.assertSessionOptions(existing, params)
     const pending = this.sessionCreations.get(sessionId)
-    if (pending) return pending
-    const creation = this.createSession(sessionId)
+    if (pending !== undefined) return this.assertSessionOptions(await pending, params)
+    const creation = this.createSession(sessionId, cwd ?? this.cwd, agentPreset)
     this.sessionCreations.set(sessionId, creation)
     void creation.then(
       () => { this.sessionCreations.delete(sessionId) },
@@ -331,14 +341,29 @@ export class HarnessSdkJsonRpcServer {
     return creation
   }
 
-  private async createSession(sessionId: string): Promise<SessionRecord> {
-    // No preset composition: this server's compositions keep the model-facing
-    // rows in the host plane, so this agent reads them from the global layer. A
-    // deployment that configures a roster has to join one here first
-    // (@deepseek-ai/dsh-agent-preset-registry README, "Composing a child agent").
+  private assertSessionOptions(record: SessionRecord, params: SessionPromptParams): SessionRecord {
+    if (params.cwd !== undefined && params.cwd !== record.cwd) {
+      throw new Error(`session "${params.sessionId}" already uses cwd "${record.cwd}"`)
+    }
+    if (params.agentPreset !== undefined && params.agentPreset !== record.agentPreset) {
+      throw new Error(`session "${params.sessionId}" already uses preset "${record.agentPreset ?? ''}"`)
+    }
+    return record
+  }
+
+  private async createSession(
+    sessionId: string, cwd: string, agentPreset: string | undefined,
+  ): Promise<SessionRecord> {
+    let setup: AgentSetup | undefined
+    if (agentPreset !== undefined) {
+      const presets = this.ctx.get('agentPresets')
+      if (presets === undefined) throw new Error('session agentPreset requires an Agent preset registry')
+      setup = async (agentCtx: Context) => { await presets.mount(agentCtx, agentPreset) }
+    }
     const handle = await this.ctx.agents.create({
       sessionId: brandString<SessionId>(sessionId),
-      meta: { cwd: this.cwd },
+      meta: { cwd, ...agentPreset === undefined ? {} : { agentPreset } },
+      ...setup === undefined ? {} : { setup },
       agentOptions: {
         provider: this.provider,
         model: this.model,
@@ -346,7 +371,7 @@ export class HarnessSdkJsonRpcServer {
         ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens },
       },
     })
-    const rec: SessionRecord = { handle }
+    const rec: SessionRecord = { handle, cwd, agentPreset }
     this.sessions.set(sessionId, rec)
     return rec
   }

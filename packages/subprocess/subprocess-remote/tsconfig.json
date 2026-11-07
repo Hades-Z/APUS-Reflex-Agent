@@ -16,6 +16,12 @@
     },
     {
       "path": "../../subprocess/subprocess"
+    },
+    {
+      "path": "../../core/session"
+    },
+    {
+      "path": "../subprocess-local"
     }
   ]
 }

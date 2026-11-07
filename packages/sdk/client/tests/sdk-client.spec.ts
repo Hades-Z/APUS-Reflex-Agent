@@ -63,6 +63,17 @@ async function tempDir(prefix: string): Promise<string> {
 }
 
 describe('DeepSeekHarness', () => {
+  it('carries session cwd and preset independently of the initialized runtime', async () => {
+    const directory = await tempDir('sdk-session-options-')
+    const recording = join(directory, 'prompts.jsonl')
+    const harness = harnessWith({ FAKE_RECORD_PROMPTS: recording })
+    await harness.run('inspect the task', {
+      sessionId: 'task', cwd: '/app/task', agentPreset: 'benchmark-task',
+    })
+    const params = JSON.parse((await readFile(recording, 'utf8')).trim()) as Record<string, unknown>
+    expect(params).toMatchObject({ sessionId: 'task', cwd: '/app/task', agentPreset: 'benchmark-task' })
+  })
+
   it('replays a Continuum memory decision receipt through the TypeScript SDK wire', async () => {
     const harness = harnessWith({ FAKE_CONTINUUM_RECEIPT: '1' })
     const result = await new HarnessSession(harness, 'owned').run('replay memory')

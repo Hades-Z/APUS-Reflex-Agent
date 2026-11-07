@@ -1268,7 +1268,7 @@ def _wait_until(predicate, description: str, timeout: float = 5.0) -> None:
 
 def test_session_cancel_bounds_its_wait_for_an_unanswered_prompt(tmp_path: Path) -> None:
     """An in-flight prompt without a receipt must not hang the cancellation."""
-    never = tmp_path / "never"
+    received = tmp_path / "prompt-received"
     script = tmp_path / "fake_runtime.py"
     script.write_text(
         f"""
@@ -1281,7 +1281,8 @@ for line in sys.stdin:
     if method == "initialize":
         print(json.dumps({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"serverInfo": {{"name": "fake-dsh"}}}}}}), flush=True)
     elif method == "session/prompt":
-        pass
+        with open({str(received)!r}, "w") as signal:
+            signal.write("received")
     elif method == "session/cancel":
         params = msg.get("params") or {{}}
         print(json.dumps({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": params["sessionId"], "cancelled": True}}}}), flush=True)
@@ -1306,11 +1307,7 @@ for line in sys.stdin:
 
         stuck = threading.Thread(target=abandoned_prompt, daemon=True)
         stuck.start()
-        deadline = time.monotonic() + 5
-        while "hung" not in client._session_prompts_in_flight:
-            if time.monotonic() > deadline:
-                raise AssertionError("the prompt never registered as in flight")
-            time.sleep(0.005)
+        _wait_until(received.exists, "the runtime to receive the prompt")
 
         # The prompt keeps its long budget; the cancellation gets a short one,
         # so only the cancel wait bound is under test.
@@ -1322,6 +1319,9 @@ for line in sys.stdin:
             assert time.monotonic() - started < 2.0
         finally:
             client.config.request_timeout_seconds = 30.0
+
+    stuck.join(timeout=5)
+    assert not stuck.is_alive()
 
 
 def test_client_close_is_idempotent_before_and_after_start(tmp_path: Path) -> None:
@@ -1570,3 +1570,45 @@ for line in sys.stdin:
         time.sleep(0.05)
     client.close()
     assert len(launches) == 1, f"each caller spawned its own runtime: {len(launches)}"
+
+
+def test_session_cwd_is_sent_and_frozen_without_changing_runtime_cwd(tmp_path: Path) -> None:
+    script = tmp_path / "session_options_runtime.py"
+    calls = tmp_path / "prompts.jsonl"
+    script.write_text("""
+import json, os, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"serverInfo": {"name": "fake-runtime"}}
+    elif method == "session/prompt":
+        params = msg["params"]
+        with open(os.environ["PROMPT_DUMP"], "a") as f:
+            f.write(json.dumps(params) + "\\n")
+        sid = params["sessionId"]
+        result = {"messageId": "m-1"}
+        print(json.dumps({"jsonrpc": "2.0", "method": "session.event", "params": {"sessionId": sid, "event": {"type": "agent/inbox/spliced", "data": {"target": "next-turn", "inserted": [{"id": "m-1"}]}}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "session.status", "params": {"sessionId": sid, "status": "idle"}}), flush=True)
+    elif method == "shutdown":
+        result = {}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+    if method == "shutdown":
+        break
+""")
+    with DeepSeekHarness(
+        _launch_args=(sys.executable, str(script)), cwd=str(tmp_path),
+        env={"PROMPT_DUMP": str(calls)},
+    ) as harness:
+        harness.run("first", session_id="task-a", cwd="/app/task-a", agent_preset="benchmark-task")
+        harness.run("second", session_id="task-b", cwd="/app/task-b")
+        harness.run("followup", session_id="task-a")
+        with pytest.raises(ValueError, match="cwd"):
+            harness.run("must not be delivered", session_id="task-a", cwd="/app/wrong")
+        with pytest.raises(ValueError, match="preset"):
+            harness.run("must not switch", session_id="task-a", agent_preset="another")
+    sent = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert [item["cwd"] for item in sent] == ["/app/task-a", "/app/task-b", "/app/task-a"]
+    assert [item.get("agentPreset") for item in sent] == ["benchmark-task", None, "benchmark-task"]

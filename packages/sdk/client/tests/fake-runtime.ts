@@ -271,6 +271,7 @@ reader.on('line', (line) => {
       respond({ serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' } })
       return
     case 'session/prompt': {
+      if (env.FAKE_RECORD_PROMPTS !== undefined) appendFileSync(env.FAKE_RECORD_PROMPTS, `${JSON.stringify(frame.params)}\n`)
       const sessionId = sessionIdOf(frame.params)
       const messageId = `fake-user-${seq}`
       event(sessionId, 'agent/inbox/spliced', {

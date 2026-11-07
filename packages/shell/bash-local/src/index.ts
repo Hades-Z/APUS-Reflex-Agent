@@ -161,6 +161,7 @@ export class LocalBashExecutor extends ShellExecutor {
       ({ maxBytes, spill: { maxBytes: this.config.maxSpillBytes.get() } })
     return {
       argv,
+      ...spec.agentId === undefined ? {} : { agentId: spec.agentId },
       cwd: spec.workdir,
       stdio: {
         stdin: spec.stdin !== undefined ? { data: spec.stdin } : 'ignore',
@@ -274,8 +275,6 @@ export class LocalBashExecutor extends ShellExecutor {
     const spawned = preparationTimedOut
       ? Promise.resolve({ exitCode: null, signal: null })
       : running !== undefined ? running.done
-      // The original throw is preserved for callers even when it was not an Error.
-      // eslint-disable-next-line prefer-promise-reject-errors
         : Promise.reject(spawnThrow())
 
     // A provider rejection produces no process output, so the subprocess

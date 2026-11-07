@@ -12,13 +12,13 @@
       "path": "../../../vendor/cordis"
     },
     {
-      "path": "../../../vendor/schemastery"
+      "path": "../bash-local"
     },
     {
-      "path": "../../util/timeout"
+      "path": "../shell"
     },
     {
-      "path": "../../shell/shell"
+      "path": "../../subprocess/subprocess"
     }
   ]
 }

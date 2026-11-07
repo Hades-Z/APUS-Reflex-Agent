@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -94,6 +95,8 @@ class DeepSeekHarness:
             _launch_args=_launch_args,
         )
         self._initialized = False
+        self._sessions: dict[str, Session] = {}
+        self._session_lock = threading.Lock()
 
     def __enter__(self) -> "DeepSeekHarness":
         self.start()
@@ -122,10 +125,33 @@ class DeepSeekHarness:
     def close(self) -> None:
         self._client.close()
         self._initialized = False
+        self._sessions.clear()
 
-    def start_session(self, session_id: str | None = None) -> "Session":
+    def start_session(
+        self, session_id: str | None = None, *, cwd: str | None = None,
+        agent_preset: str | None = None,
+    ) -> "Session":
+        if cwd is not None and (
+            not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute()
+        ):
+            raise ValueError("session cwd must be an absolute path")
+        if agent_preset is not None and (
+            not isinstance(agent_preset, str) or not agent_preset.strip()
+        ):
+            raise ValueError("session agent_preset must be a nonempty string")
         self.start()
-        return Session(self, session_id or f"session-{uuid.uuid4().hex}")
+        identity = session_id or f"session-{uuid.uuid4().hex}"
+        with self._session_lock:
+            existing = self._sessions.get(identity)
+            if existing is not None:
+                if cwd is not None and cwd != existing.cwd:
+                    raise ValueError(f"session {identity!r} already uses cwd {existing.cwd!r}")
+                if agent_preset is not None and agent_preset != existing.agent_preset:
+                    raise ValueError(f"session {identity!r} already uses preset {existing.agent_preset!r}")
+                return existing
+            session = Session(self, identity, cwd=cwd or self._cwd, agent_preset=agent_preset)
+            self._sessions[identity] = session
+            return session
 
     def cancel_session(self, session_id: str) -> None:
         """Cancel one session's work and wait until the runtime confirms it stopped.
@@ -141,18 +167,33 @@ class DeepSeekHarness:
         input: str | list[JsonObject],
         *,
         session_id: str | None = None,
+        cwd: str | None = None,
+        agent_preset: str | None = None,
         on_notification: Callable[[Notification], None] | None = None,
         before_deliver: Callable[[], None] | None = None,
     ) -> RunResult:
-        return self.start_session(session_id).run(
+        return self.start_session(session_id, cwd=cwd, agent_preset=agent_preset).run(
             input, on_notification=on_notification, before_deliver=before_deliver
         )
 
 
 class Session:
-    def __init__(self, harness: DeepSeekHarness, session_id: str) -> None:
+    def __init__(
+        self, harness: DeepSeekHarness, session_id: str, *, cwd: str | None = None,
+        agent_preset: str | None = None,
+    ) -> None:
         self.harness = harness
         self.id = session_id
+        self._cwd = cwd or harness._cwd
+        self._agent_preset = agent_preset
+
+    @property
+    def cwd(self) -> str:
+        return self._cwd
+
+    @property
+    def agent_preset(self) -> str | None:
+        return self._agent_preset
 
     def run(
         self,
@@ -183,6 +224,8 @@ class Session:
             message_id = self.harness.client.session_prompt(
                 self.id,
                 content_blocks,
+                cwd=self.cwd,
+                agent_preset=self.agent_preset,
                 notification_subscription=subscription,
                 before_deliver=before_deliver,
             )
