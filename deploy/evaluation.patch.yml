@@ -38,7 +38,19 @@
 - id: fs-sandbox
   disabled: true
 
+# `glob` and `grep` run ripgrep through the subprocess seam rather than the
+# filesystem provider, so that seam must reach the task container too.
+- id: subprocess
+  disabled: true
+
 - insert:
+    - id: subprocess-remote
+      name: /workspace/packages/subprocess/subprocess-remote/lib/index.js
+      config:
+        endpoint: !!js 'process.env.PIPELINE_EXEC_ENDPOINT?.trim()'
+        token: !!js 'process.env.PIPELINE_API_TOKEN?.trim()'
+        timeoutSec: !!js 'Number(process.env.PIPELINE_SUBPROCESS_TIMEOUT_SEC || 600)'
+
     - id: fs-remote
       name: /workspace/packages/fs/fs-remote/lib/index.js
       config:

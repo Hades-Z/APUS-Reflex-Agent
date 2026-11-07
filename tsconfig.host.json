@@ -371,6 +371,7 @@
     { "path": "./packages/shell/bash-local" },
     { "path": "./packages/shell/bash-remote" },
     { "path": "./packages/fs/fs-remote" },
+    { "path": "./packages/subprocess/subprocess-remote" },
     { "path": "./packages/shell/shell-env" },
     { "path": "./packages/shell/pwsh-local" },
     { "path": "./packages/shell/pwsh-sandbox" },
