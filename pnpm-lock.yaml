@@ -11188,6 +11188,9 @@ importers:
       '@deepseek-ai/dsh-session':
         specifier: workspace:*
         version: link:../../core/session
+      '@deepseek-ai/dsh-web':
+        specifier: workspace:*
+        version: link:../../web/web
 
   packages/lsp/lsp-stdio:
     dependencies:

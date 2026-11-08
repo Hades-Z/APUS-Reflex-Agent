@@ -156,6 +156,8 @@ export interface ToolProviderSelectedEventData {
   readonly capability: ToolProviderSelectedCapability
   /** Tool call this execution served, when the caller supplied one. */
   readonly callId?: string
+  /** Lsp query operation whose provider was selected; lsp records only. */
+  readonly operation?: string
   /** Registered id of the provider that ran. */
   readonly providerId: string
   /** How selection chose it: an explicit config id, the single usable provider, or the file's extension. */
