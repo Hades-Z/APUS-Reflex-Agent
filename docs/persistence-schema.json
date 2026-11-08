@@ -8909,6 +8909,207 @@
       }
     },
     {
+      "key": "event:continuum/memory-recall-decision",
+      "kind": "event",
+      "event": "continuum/memory-recall-decision",
+      "surface": false,
+      "digest": "ebc96301fd38bc561480ea9f1f751811bc92f787e5cd3e44449df6200fb69793",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 22,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 23,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "activeRecords",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "candidateRecords",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "injectedRecords",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "outcome",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "queryChars",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "querySource",
+                "type": 7,
+                "optional": true
+              },
+              {
+                "name": "reason",
+                "type": 8,
+                "optional": false
+              },
+              {
+                "name": "step",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "turn",
+                "type": 2,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "union",
+            "types": [
+              4,
+              5,
+              6
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "failed"
+          },
+          {
+            "kind": "literal",
+            "value": "injected"
+          },
+          {
+            "kind": "literal",
+            "value": "skipped"
+          },
+          {
+            "kind": "literal",
+            "value": "latest-user-message"
+          },
+          {
+            "kind": "union",
+            "types": [
+              5,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "cancelled"
+          },
+          {
+            "kind": "literal",
+            "value": "consumer-inactive"
+          },
+          {
+            "kind": "literal",
+            "value": "empty-store"
+          },
+          {
+            "kind": "literal",
+            "value": "error"
+          },
+          {
+            "kind": "literal",
+            "value": "no-query"
+          },
+          {
+            "kind": "literal",
+            "value": "no-candidates"
+          },
+          {
+            "kind": "literal",
+            "value": "no-controller"
+          },
+          {
+            "kind": "literal",
+            "value": "no-query-match"
+          },
+          {
+            "kind": "literal",
+            "value": "no-store"
+          },
+          {
+            "kind": "literal",
+            "value": "selection-empty"
+          },
+          {
+            "kind": "literal",
+            "value": "stale"
+          },
+          {
+            "kind": "literal",
+            "value": "step-rejected"
+          },
+          {
+            "kind": "literal",
+            "value": "unavailable"
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "continuum/memory-recall-decision"
+          }
+        ]
+      }
+    },
+    {
       "key": "event:continuum/memory-record",
       "kind": "event",
       "event": "continuum/memory-record",
@@ -34413,6 +34614,20 @@
   ],
   "types": [
     {
+      "digest": "010f8b3144c63a6a7dede319b2d4c968cfc06a9ec36cf9482eb7054ab1222e22",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "no-query"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "0116b1f89c05221d56b0ba35c83d302bf4857bc7277d247e9bbaf74b27d2c66e",
       "schema": {
         "root": 0,
@@ -40539,6 +40754,95 @@
       "sources": []
     },
     {
+      "digest": "029d96748356b84149c9164ee93a55ce3567a00cb46026bf3f644f37c232c7dc",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "union",
+            "types": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "cancelled"
+          },
+          {
+            "kind": "literal",
+            "value": "consumer-inactive"
+          },
+          {
+            "kind": "literal",
+            "value": "selection-empty"
+          },
+          {
+            "kind": "literal",
+            "value": "stale"
+          },
+          {
+            "kind": "literal",
+            "value": "step-rejected"
+          },
+          {
+            "kind": "literal",
+            "value": "unavailable"
+          },
+          {
+            "kind": "literal",
+            "value": "empty-store"
+          },
+          {
+            "kind": "literal",
+            "value": "error"
+          },
+          {
+            "kind": "literal",
+            "value": "injected"
+          },
+          {
+            "kind": "literal",
+            "value": "no-candidates"
+          },
+          {
+            "kind": "literal",
+            "value": "no-controller"
+          },
+          {
+            "kind": "literal",
+            "value": "no-query"
+          },
+          {
+            "kind": "literal",
+            "value": "no-query-match"
+          },
+          {
+            "kind": "literal",
+            "value": "no-store"
+          }
+        ]
+      },
+      "names": [
+        "packages/context/continuum/src/persistence.ts#MemoryRecallDecisionReason"
+      ],
+      "sources": [
+        "packages/context/continuum/src/persistence.ts:154"
+      ]
+    },
+    {
       "digest": "02b1b999201f9607c601c432ff0ef57115bbf97d22a887f3898ccf85d216eeef",
       "schema": {
         "root": 0,
@@ -40580,6 +40884,170 @@
       ]
     },
     {
+      "digest": "02b6331345e63cf02e4722c3fa821b8ffcea7e281b8801a2ddc6a1b9def8a3c0",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "activeRecords",
+                "type": 1,
+                "optional": true
+              },
+              {
+                "name": "candidateRecords",
+                "type": 1,
+                "optional": true
+              },
+              {
+                "name": "injectedRecords",
+                "type": 1,
+                "optional": true
+              },
+              {
+                "name": "outcome",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "queryChars",
+                "type": 1,
+                "optional": true
+              },
+              {
+                "name": "querySource",
+                "type": 6,
+                "optional": true
+              },
+              {
+                "name": "reason",
+                "type": 7,
+                "optional": false
+              },
+              {
+                "name": "step",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "turn",
+                "type": 1,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "union",
+            "types": [
+              3,
+              4,
+              5
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "failed"
+          },
+          {
+            "kind": "literal",
+            "value": "injected"
+          },
+          {
+            "kind": "literal",
+            "value": "skipped"
+          },
+          {
+            "kind": "literal",
+            "value": "latest-user-message"
+          },
+          {
+            "kind": "union",
+            "types": [
+              4,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "cancelled"
+          },
+          {
+            "kind": "literal",
+            "value": "consumer-inactive"
+          },
+          {
+            "kind": "literal",
+            "value": "empty-store"
+          },
+          {
+            "kind": "literal",
+            "value": "error"
+          },
+          {
+            "kind": "literal",
+            "value": "no-candidates"
+          },
+          {
+            "kind": "literal",
+            "value": "no-controller"
+          },
+          {
+            "kind": "literal",
+            "value": "no-query-match"
+          },
+          {
+            "kind": "literal",
+            "value": "no-query"
+          },
+          {
+            "kind": "literal",
+            "value": "no-store"
+          },
+          {
+            "kind": "literal",
+            "value": "selection-empty"
+          },
+          {
+            "kind": "literal",
+            "value": "stale"
+          },
+          {
+            "kind": "literal",
+            "value": "step-rejected"
+          },
+          {
+            "kind": "literal",
+            "value": "unavailable"
+          }
+        ]
+      },
+      "names": [
+        "packages/context/continuum/src/persistence.ts#MemoryRecallDecisionEventData"
+      ],
+      "sources": [
+        "packages/context/continuum/src/persistence.ts:171"
+      ]
+    },
+    {
       "digest": "02f792527f83910084b549e804c3ee7403fe8bb1a8cf3cea37ce0c2f90012ca1",
       "schema": {
         "root": 0,
@@ -40615,6 +41083,20 @@
           {
             "kind": "literal",
             "value": "product-interaction"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "0399dbb8779823985ac2926075e1c92d7886f176e80f8553d721555f64fcbf4a",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "injected"
           }
         ]
       },
@@ -40827,6 +41309,20 @@
           {
             "kind": "primitive",
             "type": "string"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "06331b9f0795e917a7d8548105bf1c6d70250cf39968349c5a81a66cac2e4e9c",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "selection-empty"
           }
         ]
       },
@@ -47634,7 +48130,7 @@
         "packages/context/continuum/src/persistence.ts#MemoryIndexQueuedEventData"
       ],
       "sources": [
-        "packages/context/continuum/src/persistence.ts:197"
+        "packages/context/continuum/src/persistence.ts:236"
       ]
     },
     {
@@ -50737,6 +51233,20 @@
           {
             "kind": "literal",
             "value": "web/search-route"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "1fd0303c6b3ab3ffb8be8a3f2dac13f75bfcf2b419670587a9f7878aa291387e",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "consumer-inactive"
           }
         ]
       },
@@ -57984,6 +58494,20 @@
       "sources": []
     },
     {
+      "digest": "2332ad5945e5d042b834579921bac629aa6a6a6a22399283e660c90ea60ca41a",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "empty-store"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "234142ee4f996f38cc9fa3b8b3e3de29b03c9aefe5ebf6c224eddd564505aa85",
       "schema": {
         "root": 0,
@@ -64120,6 +64644,34 @@
           {
             "kind": "literal",
             "value": "step/start"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "2caf31746ef199dd82f6943e9c77e031924ede503674e61981e045ecee23cb59",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "no-controller"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "2cea55a8ba560cb914981ca789b4d781048f98cc15e7eb4b058ed2faafeadd68",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "no-store"
           }
         ]
       },
@@ -97573,7 +98125,7 @@
         "packages/context/continuum/src/persistence.ts#MemoryIndexRebuiltEventData"
       ],
       "sources": [
-        "packages/context/continuum/src/persistence.ts:180"
+        "packages/context/continuum/src/persistence.ts:219"
       ]
     },
     {
@@ -112378,6 +112930,20 @@
       "sources": []
     },
     {
+      "digest": "a035de13c0aebc6a45def20a64d4008231cd4f006de850c999f3c0681363e3be",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "step-rejected"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "a08b64e63b930ddf31679dc4de8424786c7f497169323a50ab043b260545e26f",
       "schema": {
         "root": 0,
@@ -114885,6 +115451,20 @@
           {
             "kind": "literal",
             "value": "agent/pre-step"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "a886d9e11e8bdf14dd152bf8062d5fff8aaf1bf3e91cbdd7ed1dece6fe214002",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "continuum/memory-recall-decision"
           }
         ]
       },
@@ -143800,6 +144380,36 @@
       ]
     },
     {
+      "digest": "e8a19069a643d13dba0d9f17e00ce68d5bb9dbc9df72537f0dad3447c5e60975",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "union",
+            "types": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "failed"
+          },
+          {
+            "kind": "literal",
+            "value": "injected"
+          },
+          {
+            "kind": "literal",
+            "value": "skipped"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "e8de0f457fed5b9ff94dc4950b59ef75fd8ba8af665cc7899485924a62653367",
       "schema": {
         "root": 0,
@@ -144855,6 +145465,205 @@
           {
             "kind": "literal",
             "value": "image/webp"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "ebc96301fd38bc561480ea9f1f751811bc92f787e5cd3e44449df6200fb69793",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 22,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 23,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "activeRecords",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "candidateRecords",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "injectedRecords",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "outcome",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "queryChars",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "querySource",
+                "type": 7,
+                "optional": true
+              },
+              {
+                "name": "reason",
+                "type": 8,
+                "optional": false
+              },
+              {
+                "name": "step",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "turn",
+                "type": 2,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "union",
+            "types": [
+              4,
+              5,
+              6
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "failed"
+          },
+          {
+            "kind": "literal",
+            "value": "injected"
+          },
+          {
+            "kind": "literal",
+            "value": "skipped"
+          },
+          {
+            "kind": "literal",
+            "value": "latest-user-message"
+          },
+          {
+            "kind": "union",
+            "types": [
+              5,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "cancelled"
+          },
+          {
+            "kind": "literal",
+            "value": "consumer-inactive"
+          },
+          {
+            "kind": "literal",
+            "value": "empty-store"
+          },
+          {
+            "kind": "literal",
+            "value": "error"
+          },
+          {
+            "kind": "literal",
+            "value": "no-query"
+          },
+          {
+            "kind": "literal",
+            "value": "no-candidates"
+          },
+          {
+            "kind": "literal",
+            "value": "no-controller"
+          },
+          {
+            "kind": "literal",
+            "value": "no-query-match"
+          },
+          {
+            "kind": "literal",
+            "value": "no-store"
+          },
+          {
+            "kind": "literal",
+            "value": "selection-empty"
+          },
+          {
+            "kind": "literal",
+            "value": "stale"
+          },
+          {
+            "kind": "literal",
+            "value": "step-rejected"
+          },
+          {
+            "kind": "literal",
+            "value": "unavailable"
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "continuum/memory-recall-decision"
           }
         ]
       },
@@ -146709,6 +147518,20 @@
           {
             "kind": "primitive",
             "type": "string"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "f2511d79be05bc19fa8c960ef480056a2bbc8b7cf4911dca388173d51ea0d63f",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "skipped"
           }
         ]
       },

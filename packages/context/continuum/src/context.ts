@@ -5,10 +5,10 @@ import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { MemoryId, MemoryRecordStore } from './records.ts'
 import {
   budgetMemoryWorkingSetWithDrops, renderMemoryWorkingSet, retrieveMemoryWorkingSet, retrieveMemoryWorkingSetWithReport,
-  type MemoryCandidatePool, type MemoryRetrievalConfig,
+  type MemoryCandidatePool, type MemoryRetrievalConfig, type MemoryRetrievalReport,
 } from './retrieval.ts'
-import { MAX_RECORDED_RECORDS, type MemoryRetrievalLimits } from './persistence.ts'
-import { recordMemoryRetrieval, type MemoryRetrievalRecorder } from './retrieval-events.ts'
+import { MAX_RECORDED_RECORDS, type MemoryRecallDecisionReason, type MemoryRetrievalLimits } from './persistence.ts'
+import { recordMemoryRecallDecision, recordMemoryRetrieval, type MemoryRetrievalRecorder } from './retrieval-events.ts'
 import type { ContinuumMemoryController, ContinuumMemoryPrincipal } from './policy.ts'
 
 /** Model-visible source for one bounded Continuum memory snapshot. */
@@ -150,24 +150,34 @@ export function installContinuumMemoryContext(
   let active = true
   const budget = retrievalBudget(config)
   const isActive = (): boolean => active
-  const stop = ctx.on('agent/pre-step', async ({ agent, messages, signal }, next): Promise<PreStepDecision> => {
+  const stop = ctx.on('agent/pre-step', async ({ agent, messages, turn, step, signal }, next): Promise<PreStepDecision> => {
     const decision = await next()
-    if (!isActive() || decision.kind === 'reject') return decision
-    const store = storeOf(agent)
     const query = latestUserText(messages)
-    if (store === undefined || query === undefined) return decision
-    signal.throwIfAborted()
-    const traced = config.trace === true
-    const outcome = traced ? retrieveMemoryWorkingSetWithReport(store, budget, query) : undefined
-    const workingSet = outcome?.workingSet ?? retrieveMemoryWorkingSet(store, budget, query)
-    if (traced && outcome !== undefined) {
-      recordMemoryRetrieval(retrievalRecorder(ctx, agent), {
-        query, limits: retrievalLimits(config), selectorMounted: false, report: outcome.report,
-        ...(workingSet.candidates.length === 0 ? {} : { injection: { workingSet, dropped: [] } }),
-      })
+    const note = recallDecision(ctx, agent, turn, step, query)
+    try {
+      if (!isActive()) { note('consumer-inactive'); return decision }
+      if (decision.kind === 'reject') { note('step-rejected'); return decision }
+      const store = storeOf(agent)
+      if (store === undefined) { note('no-store'); return decision }
+      if (query === undefined) { note('no-query'); return decision }
+      signal.throwIfAborted()
+      const { workingSet, report } = retrieveMemoryWorkingSetWithReport(store, budget, query)
+      if (config.trace === true) {
+        recordMemoryRetrieval(retrievalRecorder(ctx, agent), {
+          query, limits: retrievalLimits(config), selectorMounted: false, report,
+          ...(workingSet.candidates.length === 0 ? {} : { injection: { workingSet, dropped: [] } }),
+        })
+      }
+      if (workingSet.candidates.length === 0) {
+        note(report.activeRecords === 0 ? 'empty-store' : 'no-candidates', report)
+        return decision
+      }
+      note('injected', report, workingSet.candidates.length)
+      return { ...decision, messages: [...decision.messages, recallMessage(workingSet)] }
+    } catch (error: unknown) {
+      note(signal.aborted ? 'cancelled' : 'error')
+      throw error
     }
-    if (workingSet.candidates.length === 0) return decision
-    return { ...decision, messages: [...decision.messages, recallMessage(workingSet)] }
   })
   const dispose = ctx.effect(() => () => {
     active = false
@@ -202,93 +212,132 @@ export function installContinuumMemoryControllerContext(
   let active = true
   const budget = retrievalBudget(config)
   const isActive = (): boolean => active
-  const stop = ctx.on('agent/pre-step', async ({ agent, messages, signal }, next): Promise<PreStepDecision> => {
+  const stop = ctx.on('agent/pre-step', async ({ agent, messages, turn, step, signal }, next): Promise<PreStepDecision> => {
     const decision = await next()
-    if (!isActive() || decision.kind === 'reject') return decision
-    const controller = controllerOf(agent)
-    if (controller === undefined) return decision
     const query = latestUserText(messages)
-    if (query === undefined) return decision
-    signal.throwIfAborted()
-    const pending = pendingOf(agent)
-    if (pending !== undefined) await abortable(pending, signal)
-    if (!isActive()) return decision
-    const ticket = controller.beginRead(principalOf(agent))
-    if (ticket === undefined) return decision
-    const selector = selectorOf()
-    const traced = config.trace === true
-    const requestedLimits = selector === undefined ? budget : {
-      ...budget, maxCandidates: config.maxPool ?? config.maxCandidates, maxTotalBytes: Number.MAX_SAFE_INTEGER,
-    }
-    const outcome = traced ? controller.readWithReport(ticket, requestedLimits, query) : undefined
-    const workingSet = outcome?.workingSet ?? controller.read(ticket, requestedLimits, query)
-    if (workingSet === undefined || !controller.isCurrent(ticket) || workingSet.candidates.length === 0) return decision
-    const recorder = traced && outcome !== undefined ? retrievalRecorder(ctx, agent) : undefined
-    if (selector === undefined) {
-      const matched = renderMemoryWorkingSet(workingSet.query, workingSet.candidates.filter(candidate => candidate.score > 0))
-      if (recorder !== undefined && outcome !== undefined) {
+    const note = recallDecision(ctx, agent, turn, step, query)
+    try {
+      if (!isActive()) { note('consumer-inactive'); return decision }
+      if (decision.kind === 'reject') { note('step-rejected'); return decision }
+      const controller = controllerOf(agent)
+      if (controller === undefined) { note('no-controller'); return decision }
+      if (query === undefined) { note('no-query'); return decision }
+      signal.throwIfAborted()
+      const pending = pendingOf(agent)
+      if (pending !== undefined) await abortable(pending, signal)
+      if (!isActive()) { note('consumer-inactive'); return decision }
+      const ticket = controller.beginRead(principalOf(agent))
+      if (ticket === undefined) { note('unavailable'); return decision }
+      const selector = selectorOf()
+      const requestedLimits = selector === undefined ? budget : {
+        ...budget, maxCandidates: config.maxPool ?? config.maxCandidates, maxTotalBytes: Number.MAX_SAFE_INTEGER,
+      }
+      const outcome = controller.readWithReport(ticket, requestedLimits, query)
+      if (outcome === undefined || !controller.isCurrent(ticket)) { note('stale'); return decision }
+      const { workingSet, report } = outcome
+      const recorder = config.trace === true ? retrievalRecorder(ctx, agent) : undefined
+      if (workingSet.candidates.length === 0) {
+        if (recorder !== undefined) {
+          recordMemoryRetrieval(recorder, {
+            query, limits: retrievalLimits(config), selectorMounted: selector !== undefined, report,
+          })
+        }
+        note(report.activeRecords === 0 ? 'empty-store' : 'no-candidates', report)
+        return decision
+      }
+      if (selector === undefined) {
+        const matched = renderMemoryWorkingSet(workingSet.query, workingSet.candidates.filter(candidate => candidate.score > 0))
+        if (recorder !== undefined) {
+          recordMemoryRetrieval(recorder, {
+            query, limits: retrievalLimits(config), selectorMounted: false, report,
+            ...(matched.candidates.length === 0 ? {} : {
+              injection: {
+                workingSet: matched,
+                dropped: workingSet.candidates.filter(candidate => candidate.score === 0)
+                  .map(candidate => ({ id: candidate.id, reason: 'no-query-match' as const })),
+              },
+            }),
+          })
+        }
+        if (matched.candidates.length === 0) { note('no-query-match', report); return decision }
+        note('injected', report, matched.candidates.length)
+        return { ...decision, messages: [...decision.messages, recallMessage(matched)] }
+      }
+      const selection = await selector.select(agent, {
+        query,
+        isCurrent: () => isActive() && controller.isCurrent(ticket),
+        candidates: workingSet.candidates.map(candidate => ({
+          id: String(candidate.id),
+          label: candidate.record.kind,
+          excerpt: candidate.excerpt,
+          score: candidate.score,
+          tags: tagsOf(agent, candidate.id),
+        })),
+        limits: {
+          maxCandidates: config.maxCandidates,
+          maxExcerptBytes: config.maxExcerptBytes,
+          maxTotalBytes: config.maxTotalBytes,
+          candidatePool: config.candidatePool ?? 'lexical',
+          maxPool: config.maxPool ?? config.maxCandidates,
+          admission: config.admission ?? 'explicit',
+        },
+      }, signal)
+      signal.throwIfAborted()
+      if (!isActive()) { note('consumer-inactive', report); return decision }
+      if (!controller.isCurrent(ticket)) { note('stale', report); return decision }
+      const byId = new Map(workingSet.candidates.map(candidate => [String(candidate.id), candidate]))
+      const candidates = [...new Set(selection.selectedIds)].flatMap((id) => {
+        const candidate = byId.get(id)
+        return candidate === undefined ? [] : [candidate]
+      })
+      const budgeted = budgetMemoryWorkingSetWithDrops(workingSet.query, candidates, config.maxTotalBytes)
+      if (recorder !== undefined) {
         recordMemoryRetrieval(recorder, {
-          query, limits: retrievalLimits(config), selectorMounted: false, report: outcome.report,
-          ...(matched.candidates.length === 0 ? {} : {
-            injection: {
-              workingSet: matched,
-              dropped: workingSet.candidates.filter(candidate => candidate.score === 0)
-                .map(candidate => ({ id: candidate.id, reason: 'no-query-match' as const })),
+          query, limits: retrievalLimits(config), selectorMounted: true, report,
+          injection: {
+            workingSet: budgeted.workingSet,
+            dropped: budgeted.dropped,
+            selection: {
+              mode: selection.mode, outcome: selection.outcome,
+              selectedIds: [...selection.selectedIds].slice(0, MAX_RECORDED_RECORDS),
+              baselineIds: [...selection.baselineIds].slice(0, MAX_RECORDED_RECORDS),
             },
-          }),
+          },
         })
       }
-      return matched.candidates.length === 0 ? decision : { ...decision, messages: [...decision.messages, recallMessage(matched)] }
+      if (budgeted.workingSet.candidates.length === 0) { note('selection-empty', report); return decision }
+      note('injected', report, budgeted.workingSet.candidates.length)
+      return { ...decision, messages: [...decision.messages, recallMessage(budgeted.workingSet)] }
+    } catch (error: unknown) {
+      note(signal.aborted ? 'cancelled' : 'error')
+      throw error
     }
-    const selection = await selector.select(agent, {
-      query,
-      isCurrent: () => isActive() && controller.isCurrent(ticket),
-      candidates: workingSet.candidates.map(candidate => ({
-        id: String(candidate.id),
-        label: candidate.record.kind,
-        excerpt: candidate.excerpt,
-        score: candidate.score,
-        tags: tagsOf(agent, candidate.id),
-      })),
-      limits: {
-        maxCandidates: config.maxCandidates,
-        maxExcerptBytes: config.maxExcerptBytes,
-        maxTotalBytes: config.maxTotalBytes,
-        candidatePool: config.candidatePool ?? 'lexical',
-        maxPool: config.maxPool ?? config.maxCandidates,
-        admission: config.admission ?? 'explicit',
-      },
-    }, signal)
-    signal.throwIfAborted()
-    if (!isActive() || !controller.isCurrent(ticket)) return decision
-    const byId = new Map(workingSet.candidates.map(candidate => [String(candidate.id), candidate]))
-    const candidates = [...new Set(selection.selectedIds)].flatMap((id) => {
-      const candidate = byId.get(id)
-      return candidate === undefined ? [] : [candidate]
-    })
-    const budgeted = budgetMemoryWorkingSetWithDrops(workingSet.query, candidates, config.maxTotalBytes)
-    if (recorder !== undefined && outcome !== undefined) {
-      recordMemoryRetrieval(recorder, {
-        query, limits: retrievalLimits(config), selectorMounted: true, report: outcome.report,
-        injection: {
-          workingSet: budgeted.workingSet,
-          dropped: budgeted.dropped,
-          selection: {
-            mode: selection.mode, outcome: selection.outcome,
-            selectedIds: [...selection.selectedIds].slice(0, MAX_RECORDED_RECORDS),
-            baselineIds: [...selection.baselineIds].slice(0, MAX_RECORDED_RECORDS),
-          },
-        },
-      })
-    }
-    if (budgeted.workingSet.candidates.length === 0) return decision
-    return { ...decision, messages: [...decision.messages, recallMessage(budgeted.workingSet)] }
   })
   const dispose = ctx.effect(() => () => {
     active = false
     stop()
   })
   return () => { void dispose() }
+}
+
+/** Record one judgement's terminal reason without depending on detailed retrieval tracing. */
+function recallDecision(
+  ctx: Context,
+  agent: Agent,
+  turn: number,
+  step: number,
+  query: string | undefined,
+): (reason: MemoryRecallDecisionReason, report?: MemoryRetrievalReport, injectedRecords?: number) => void {
+  return (reason, report, injectedRecords) => {
+    recordMemoryRecallDecision(retrievalRecorder(ctx, agent), {
+      turn, step,
+      outcome: reason === 'injected' ? 'injected' : reason === 'error' || reason === 'cancelled' ? 'failed' : 'skipped',
+      reason,
+      ...(query === undefined ? {} : { querySource: 'latest-user-message' as const, queryChars: query.length }),
+      ...(report === undefined ? {} : { activeRecords: report.activeRecords, candidateRecords: report.candidateRecords }),
+      ...(injectedRecords === undefined ? {} : { injectedRecords }),
+    })
+  }
 }
 
 /** Numeric retrieval budgets only; the observation switch must not reach budget validation. */

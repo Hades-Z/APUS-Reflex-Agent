@@ -41,6 +41,7 @@ export const KNOWN_SESSION_EVENT_TYPES: ReadonlySet<string> = new Set([
   'continuum/memory-index-queued',
   'continuum/memory-index-rebuilt',
   'continuum/memory-injected',
+  'continuum/memory-recall-decision',
   'continuum/memory-record',
   'continuum/memory-retrieval',
   'continuum/memory-scored',

@@ -150,6 +150,43 @@ export interface MemoryInjectedEventData {
   readonly selection?: MemorySelectionRecord
 }
 
+/** Why one pre-step recall judgement did or did not add memory context to the request. */
+export type MemoryRecallDecisionReason =
+  | 'injected'
+  | 'consumer-inactive'
+  | 'step-rejected'
+  | 'no-store'
+  | 'no-controller'
+  | 'no-query'
+  | 'unavailable'
+  | 'empty-store'
+  | 'no-candidates'
+  | 'no-query-match'
+  | 'selection-empty'
+  | 'stale'
+  | 'cancelled'
+  | 'error'
+
+/** Terminal facts of one pre-step recall judgement; log-only and independent of detailed retrieval tracing. */
+export interface MemoryRecallDecisionEventData {
+  /** Proposed turn and step; a rejected or empty proposal may have no later `step/start`. */
+  readonly turn: number
+  readonly step: number
+  /** `injected` means a recall message was appended in this judgement, not that a candidate merely existed. */
+  readonly outcome: 'injected' | 'skipped' | 'failed'
+  readonly reason: MemoryRecallDecisionReason
+  /** Present when a current human-message query was available. */
+  readonly querySource?: 'latest-user-message'
+  /** Full UTF-16 length of that query. */
+  readonly queryChars?: number
+  /** Active records visible to the authorized read, when a read ran. */
+  readonly activeRecords?: number
+  /** Candidates left by that read before selection, when a read ran. */
+  readonly candidateRecords?: number
+  /** Records in the recall appended by this judgement; present only for `injected`. */
+  readonly injectedRecords?: number
+}
+
 /** Maximum UTF-16 characters of a query or term recorded in a retrieval event. */
 export const MAX_RECORDED_QUERY_CHARS = 500
 /** Maximum IDs or candidates one retrieval event records; paired counts stay complete. */
@@ -161,6 +198,8 @@ declare module '@deepseek-ai/dsh-session/types' {
     'continuum/memory-record': MemoryRecordEventData
     /** An L1 index entry pointing at an original human message; log-only and never model-visible. */
     'continuum/memory-index': MemoryIndexEventData
+    /** Terminal outcome and reason of one pre-step recall judgement; log-only and never model-visible. */
+    'continuum/memory-recall-decision': MemoryRecallDecisionEventData
     /** One memory retrieval's query, authorization scope and applied limits; log-only and never model-visible. */
     'continuum/memory-retrieval': MemoryRetrievalEventData
     /** The lexical ranking one retrieval produced; log-only and never model-visible. */

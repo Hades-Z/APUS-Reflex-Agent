@@ -12,6 +12,10 @@ function records(): MemoryRecordStore {
   return store
 }
 
+const recallDecisions = (session: Session) => session.snapshotEvents()
+  .filter(event => event.type === 'continuum/memory-recall-decision')
+  .map(event => event.data)
+
 describe('Continuum same-step context consumer', () => {
   it('appends bounded memory context to the pre-step decision with a typed source', async () => {
     const ctx = new Context()
@@ -115,12 +119,15 @@ describe('Continuum same-step context consumer', () => {
 
   it('does not inject when no per-agent store is available', async () => {
     const ctx = new Context()
+    const session = Session.create(SessionId('recall-no-store'))
     installContinuumMemoryContext(ctx, () => undefined, { maxCandidates: 2, maxExcerptBytes: 100, maxTotalBytes: 512 })
     const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Recall anything.' }] })
-    const result = await agentEvents(ctx, {} as Agent).waterfall('agent/pre-step', {
+    const result = await agentEvents(ctx, { session } as Agent).waterfall('agent/pre-step', {
       messages: [user], turn: 1, step: 1, signal: new AbortController().signal,
     }, () => Promise.resolve({ kind: 'enter' as const, messages: [user] }))
     expect(result.kind === 'enter' ? result.messages : []).toHaveLength(1)
+    const reasons = recallDecisions(session).map(decision => decision.reason)
+    expect(reasons).toEqual(['no-store'])
     await ctx.fiber.dispose()
   })
 
@@ -142,14 +149,77 @@ describe('Continuum same-step context consumer', () => {
     await ctx.fiber.dispose()
   })
 
+  it('records a traced empty or unmatched read as a retrieval fact without injection', async () => {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    const session = Session.create(SessionId('trace-empty-read'))
+    installContinuumMemoryControllerContext(ctx,
+      () => new ContinuumMemoryController(new MemoryRecordStore(), { enabled: true, mode: 'active', reflexMounted: true }),
+      () => ({ scopes: ['workspace'] }), { maxCandidates: 2, maxExcerptBytes: 100, maxTotalBytes: 512, trace: true })
+    const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'When is the migration scheduled?' }] })
+    const result = await agentEvents(ctx, { session } as Agent).waterfall('agent/pre-step', {
+      messages: [user], turn: 1, step: 1, signal: new AbortController().signal,
+    }, () => Promise.resolve({ kind: 'enter' as const, messages: [user] }))
+    expect(result.kind === 'enter' ? result.messages : []).toHaveLength(1)
+    const types = new Set(session.snapshotEvents().map(event => event.type))
+    expect(types.has('continuum/memory-recall-decision')).toBe(true)
+    expect(types.has('continuum/memory-retrieval')).toBe(true)
+    expect(types.has('continuum/memory-injected')).toBe(false)
+    expect(types.has('continuum/memory-scored')).toBe(false)
+
+    const unmatched = Session.create(SessionId('trace-unmatched-read'))
+    installContinuumMemoryContext(ctx, () => records(),
+      { maxCandidates: 2, maxExcerptBytes: 100, maxTotalBytes: 512, trace: true })
+    const unrelated = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Totally unrelated words' }] })
+    const second = await agentEvents(ctx, { session: unmatched } as Agent).waterfall('agent/pre-step', {
+      messages: [unrelated], turn: 1, step: 1, signal: new AbortController().signal,
+    }, () => Promise.resolve({ kind: 'enter' as const, messages: [unrelated] }))
+    expect(second.kind === 'enter' ? second.messages : []).toHaveLength(1)
+    const unmatchedTypes = new Set(unmatched.snapshotEvents().map(event => event.type))
+    expect(unmatchedTypes.has('continuum/memory-retrieval')).toBe(true)
+    expect(unmatchedTypes.has('continuum/memory-injected')).toBe(false)
+  })
+
+  it('records a distinct terminal reason for each controller recall skip', async () => {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    const session = Session.create(SessionId('recall-decisions'))
+    let current: ContinuumMemoryController | undefined
+    installContinuumMemoryControllerContext(ctx, () => current, () => ({ scopes: ['workspace'] }),
+      { maxCandidates: 4, maxExcerptBytes: 100, maxTotalBytes: 1024 })
+    const ask = async (turn: number, messages: readonly ReturnType<typeof createUserMessage>[]) => {
+      const result = await agentEvents(ctx, { session } as Agent).waterfall('agent/pre-step', {
+        messages: [...messages], turn, step: 1, signal: new AbortController().signal,
+      }, () => Promise.resolve({ kind: 'enter' as const, messages: [...messages] }))
+      return result.kind === 'enter' ? result.messages : []
+    }
+    const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'When is the migration scheduled?' }] })
+    const unrelated = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Totally unrelated words' }] })
+    const disabled = new ContinuumMemoryController(records(), { enabled: false, mode: 'off', reflexMounted: false })
+    const empty = new ContinuumMemoryController(new MemoryRecordStore(), { enabled: true, mode: 'active', reflexMounted: true })
+    const active = new ContinuumMemoryController(records(), { enabled: true, mode: 'active', reflexMounted: true })
+    current = undefined; expect(await ask(1, [user])).toHaveLength(1)
+    current = active; expect(await ask(2, [])).toHaveLength(0)
+    current = disabled; expect(await ask(3, [user])).toHaveLength(1)
+    current = empty; expect(await ask(4, [user])).toHaveLength(1)
+    current = active; expect(await ask(5, [unrelated])).toHaveLength(1)
+    current = active; expect(await ask(6, [user])).toHaveLength(2)
+    const decisions = recallDecisions(session)
+    expect(decisions.map(decision => decision.reason))
+      .toEqual(['no-controller', 'no-query', 'unavailable', 'empty-store', 'no-candidates', 'injected'])
+    expect(decisions[4]?.activeRecords).toBe(1)
+    expect(decisions[5]).toMatchObject({ turn: 6, outcome: 'injected', querySource: 'latest-user-message', injectedRecords: 1 })
+  })
+
   it('injects only candidates that share a query term when no selector is mounted', async () => {
     const ctx = new Context()
+    const session = Session.create(SessionId('recall-no-match'))
     const controller = new ContinuumMemoryController(records(), { enabled: true, mode: 'active', reflexMounted: true })
     installContinuumMemoryControllerContext(ctx, () => controller, () => ({ scopes: ['workspace'] }),
       { maxCandidates: 4, maxExcerptBytes: 100, maxTotalBytes: 1024, candidatePool: 'all' })
     const ask = async (text: string) => {
       const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] })
-      const result = await agentEvents(ctx, {} as Agent).waterfall('agent/pre-step', {
+      const result = await agentEvents(ctx, { session } as Agent).waterfall('agent/pre-step', {
         messages: [user], turn: 1, step: 1, signal: new AbortController().signal,
       }, () => Promise.resolve({ kind: 'enter' as const, messages: [user] }))
       return result.kind === 'enter' ? result.messages : []
@@ -158,7 +228,63 @@ describe('Continuum same-step context consumer', () => {
     expect(matched).toHaveLength(2)
     expect(matched[1]?.source).toMatchObject({ recordIds: ['migration'] })
     expect(await ask('Unrelated words only')).toHaveLength(1)
+    const reasons = recallDecisions(session).map(decision => decision.reason)
+    expect(reasons).toEqual(['injected', 'no-query-match'])
     await ctx.fiber.dispose()
+  })
+
+  it('records stale, failed, cancelled and disposed recall attempts under their own reasons', async () => {
+    const bounds = { maxCandidates: 2, maxExcerptBytes: 100, maxTotalBytes: 512 }
+    const user = () => createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'When is the migration scheduled?' }] })
+    const reasonsOf = (session: Session) => recallDecisions(session).map(decision => decision.reason)
+    const prepare = (id: string) => {
+      const ctx = new Context()
+      onTestFinished(() => ctx.fiber.dispose())
+      const session = Session.create(SessionId(id))
+      const controller = new ContinuumMemoryController(records(), { enabled: true, mode: 'active', reflexMounted: true })
+      return { ctx, session, controller }
+    }
+    const call = (ctx: Context, session: Session, turn: number, signal = new AbortController().signal) =>
+      agentEvents(ctx, { session } as Agent).waterfall('agent/pre-step', {
+        messages: [user()], turn, step: 1, signal,
+      }, () => Promise.resolve({ kind: 'enter' as const, messages: [user()] }))
+
+    const stale = prepare('recall-stale')
+    installContinuumMemoryControllerContext(stale.ctx, () => stale.controller, () => ({ scopes: ['workspace'] }), bounds,
+      () => ({ select: async () => {
+        stale.controller.setSwitch({ enabled: false, mode: 'off', reflexMounted: true })
+        return { mode: 'active', selectedIds: ['migration'], baselineIds: ['migration'], outcome: 'jev' }
+      } }))
+    expect((await call(stale.ctx, stale.session, 1)).kind === 'enter' ? [1] : []).toHaveLength(1)
+    expect(reasonsOf(stale.session)).toEqual(['stale'])
+
+    const failed = prepare('recall-failed')
+    installContinuumMemoryControllerContext(failed.ctx, () => failed.controller, () => ({ scopes: ['workspace'] }), bounds,
+      () => undefined, () => Promise.reject(new Error('admission failed')))
+    await expect(call(failed.ctx, failed.session, 1)).rejects.toThrow('admission failed')
+    expect(reasonsOf(failed.session)).toEqual(['error'])
+
+    const cancelled = prepare('recall-cancelled')
+    const pending = Promise.withResolvers<undefined>()
+    const abort = new AbortController()
+    installContinuumMemoryControllerContext(cancelled.ctx, () => cancelled.controller, () => ({ scopes: ['workspace'] }), bounds,
+      () => undefined, () => pending.promise)
+    const cancelledCall = call(cancelled.ctx, cancelled.session, 1, abort.signal)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    abort.abort(new Error('turn cancelled'))
+    await expect(cancelledCall).rejects.toThrow('turn cancelled')
+    expect(reasonsOf(cancelled.session)).toEqual(['cancelled'])
+
+    const disposed = prepare('recall-disposed')
+    const disposedPending = Promise.withResolvers<undefined>()
+    const dispose = installContinuumMemoryControllerContext(disposed.ctx, () => disposed.controller, () => ({ scopes: ['workspace'] }), bounds,
+      () => undefined, () => disposedPending.promise)
+    const disposedCall = call(disposed.ctx, disposed.session, 1)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    dispose()
+    disposedPending.resolve(undefined)
+    expect((await disposedCall).kind === 'enter' ? [1] : []).toHaveLength(1)
+    expect(reasonsOf(disposed.session)).toEqual(['consumer-inactive'])
   })
 
   it('waits for pending admissions before reading and honors cancellation while waiting', async () => {
@@ -325,10 +451,13 @@ describe('Continuum same-step context consumer', () => {
     if (kind === 'baseline') installContinuumMemoryContext(ctx, unexpected, bounds)
     else installContinuumMemoryControllerContext(ctx, unexpected, () => ({ scopes: ['workspace'] }), bounds)
     const rejection = { kind: 'reject' as const }
-    const result = await agentEvents(ctx, {} as Agent).waterfall('agent/pre-step', {
+    const session = Session.create(SessionId('recall-step-rejected'))
+    const result = await agentEvents(ctx, { session } as Agent).waterfall('agent/pre-step', {
       messages: [], turn: 1, step: 1, signal: new AbortController().signal,
     }, async () => rejection)
     expect(result).toBe(rejection)
+    const reasons = recallDecisions(session).map(decision => decision.reason)
+    expect(reasons).toEqual(['step-rejected'])
   })
 
   it.each(['baseline', 'controller'] as const)('keeps %s input unchanged when only blank or generated messages exist', async (kind) => {
@@ -380,15 +509,18 @@ describe('Continuum same-step context consumer', () => {
   it.each([{ selectedIds: [] }, { selectedIds: ['unavailable-record'] }])('does not inject records outside the selected candidate set $selectedIds', async ({ selectedIds }) => {
     const ctx = new Context()
     onTestFinished(() => ctx.fiber.dispose())
+    const session = Session.create(SessionId('recall-selection-empty'))
     const controller = new ContinuumMemoryController(records(), { enabled: true, mode: 'active', reflexMounted: true })
     installContinuumMemoryControllerContext(ctx, () => controller, () => ({ scopes: ['workspace'] }),
       { maxCandidates: 2, maxExcerptBytes: 100, maxTotalBytes: 512 },
       () => ({ select: async () => ({ mode: 'active', selectedIds, baselineIds: ['migration'], outcome: 'jev' }) }))
     const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Migration' }] })
-    const result = await agentEvents(ctx, {} as Agent).waterfall('agent/pre-step', {
+    const result = await agentEvents(ctx, { session } as Agent).waterfall('agent/pre-step', {
       messages: [user], turn: 1, step: 1, signal: new AbortController().signal,
     }, async () => ({ kind: 'enter' as const, messages: [user] }))
     expect(result.kind === 'enter' ? result.messages : []).toEqual([user])
+    const reasons = recallDecisions(session).map(decision => decision.reason)
+    expect(reasons).toEqual(['selection-empty'])
   })
 
   it('rejects recall when a selector returns after cancellation', async () => {

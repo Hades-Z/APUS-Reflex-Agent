@@ -2,6 +2,7 @@
 import type { Session } from '@deepseek-ai/dsh-session'
 import type {
   MemoryInjectedEventData,
+  MemoryRecallDecisionEventData,
   MemoryRetrievalLimits,
   MemorySelectionRecord,
 } from './persistence.ts'
@@ -37,6 +38,20 @@ export interface MemoryRetrievalRecorder {
 }
 
 /**
+ * Append the terminal outcome of one pre-step recall judgement, including an empty store or a skipped read.
+ * This fact is independent of the detailed `trace` switch and never changes the read or its injection.
+ * @param recorder - Session that owns the log and a warning sink for contained append failures.
+ * @param decision - proposed position, terminal outcome, reason and any real read counts.
+ */
+export function recordMemoryRecallDecision(recorder: MemoryRetrievalRecorder, decision: MemoryRecallDecisionEventData): void {
+  try {
+    recorder.session.append('continuum/memory-recall-decision', decision)
+  } catch (error: unknown) {
+    recorder.warn(`continuum recall decision was not recorded: ${String(error)}`)
+  }
+}
+
+/**
  * Append the retrieval events for one bounded read: the read itself, its lexical ranking, every limit that excluded
  * records, and the injected record set. Each stage is written only when it holds a fact; a failed append is logged and
  * never fails or delays the read.
@@ -46,7 +61,6 @@ export interface MemoryRetrievalRecorder {
 export function recordMemoryRetrieval(recorder: MemoryRetrievalRecorder, trace: MemoryRetrievalTrace): void {
   try {
     const { report } = trace
-    if (report.activeRecords === 0) return
     const query = trace.query.slice(0, MAX_RECORDED_QUERY_CHARS)
     recorder.session.append('continuum/memory-retrieval', {
       querySource: 'latest-user-message',
