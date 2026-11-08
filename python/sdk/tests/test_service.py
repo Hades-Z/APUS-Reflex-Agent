@@ -527,6 +527,93 @@ def test_a_finished_run_reports_its_outcome_to_the_caller_named_endpoint() -> No
     assert delivered[0]["status"] == "succeeded"
 
 
+def test_result_callback_does_not_repeat_the_full_event_history() -> None:
+    """Event callbacks already carry each native event; the result stays small."""
+    harness = _FakeHarness()
+    delivered: list[dict[str, Any]] = []
+
+    class _Sink:
+        def post(self, url, payload, timeout):
+            delivered.append(payload)
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(), harness_factory=lambda _: harness, result_callback=_Sink(),
+    )
+    try:
+        run_id = service.start_run({
+            "instruction": "do it", "session_id": "case-small-result",
+            "callback_url": "http://benchmark.invalid/jobs/one/backend-result",
+        })
+        harness.gate.set()
+        _wait_for(lambda: delivered, "the result callback")
+
+        result = delivered[0]["result"]
+        assert result["final_response"] == "done"
+        assert result["finish_reason"] == "completed"
+        assert result["session_id"] == "case-small-result"
+        assert "events" not in result
+        assert "notifications" not in result
+        state = service.run_state(run_id)
+        assert state["events"] == []
+        assert state["notifications"][0]["method"] == "session.event"
+    finally:
+        harness.gate.set()
+        service.close()
+
+
+def test_pending_legacy_result_is_compacted_on_recovery_without_rerunning(tmp_path, monkeypatch) -> None:
+    import json
+
+    monkeypatch.setenv("DSH_DELIVERY_MAX_ATTEMPTS", "1")
+    monkeypatch.setenv("DSH_DELIVERY_RECOVERY_ATTEMPTS", "0")
+    harness = _FakeHarness()
+    harness.gate.set()
+
+    class _Unavailable:
+        def post(self, url, payload, timeout):
+            raise OSError("unavailable")
+
+    config = DeepSeekHarnessConfig(dsh_home=str(tmp_path))
+    service = HarnessService(config, harness_factory=lambda _: harness, result_callback=_Unavailable())
+    try:
+        run_id = service.start_run({
+            "instruction": "once", "request_id": "legacy-result",
+            "callback_url": "http://benchmark.invalid/jobs/one/backend-result",
+        })
+        _wait_for(lambda: service.run_state(run_id)["delivery_state"]["result"] == "failed", "failed result")
+    finally:
+        service.close()
+    path = tmp_path / "evaluation-runs" / run_id / "state.json"
+    stored = json.loads(path.read_text())
+    stored["result_report"]["result"] = {
+        **stored["result"], "usage": {"input_tokens": 12, "output_tokens": 3},
+    }
+    original = stored["result"]
+    path.write_text(json.dumps(stored))
+    delivered = []
+
+    class _Sink:
+        def post(self, url, payload, timeout):
+            delivered.append(payload)
+
+    def refuse_execution(_):
+        raise AssertionError("recovery must not execute the task")
+
+    recovered = HarnessService(config, harness_factory=refuse_execution, result_callback=_Sink())
+    try:
+        _wait_for(lambda: delivered, "recovered result")
+        result = delivered[0]["result"]
+        assert "events" not in result
+        assert "notifications" not in result
+        assert result["usage"] == {"input_tokens": 12, "output_tokens": 3}
+        state = recovered.run_state(run_id)
+        assert state["events"] == original["events"]
+        assert state["notifications"] == original["notifications"]
+        assert len(harness.prompts) == 1
+    finally:
+        recovered.close()
+
+
 def test_each_finished_event_is_reported_while_the_run_is_going() -> None:
     """Events reach the evaluator as they happen, not only when the run ends.
 

@@ -331,6 +331,10 @@ class HarnessService:
                 result=data["result"], error=data["error"], cancel_state=data["cancel_state"],
                 terminal_status=data.get("terminal_status"),
             )
+            if isinstance(run.result_report, dict):
+                # A report persisted before callbacks stopped repeating the
+                # event history is still oversized; compact the outbound copy.
+                run.result_report["result"] = self._callback_result(run.result_report.get("result"))
             if not data["done"]:
                 run.error = "execution state unknown after service restart; task was not rerun"
                 run.terminal_status = "failed"
@@ -693,6 +697,13 @@ class HarnessService:
         }
         self._deliver(run, body)
 
+    @staticmethod
+    def _callback_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Keep history on the event channel and in run queries, not in result callbacks."""
+        if result is None:
+            return None
+        return {key: value for key, value in result.items() if key not in {"events", "notifications"}}
+
     def _report_result(self, run: _Run, status: str) -> None:
         """Queue the immutable business outcome independently of trace delivery."""
         callback = self._result_callback
@@ -706,7 +717,7 @@ class HarnessService:
             "status": status,
             "session_id": run.session_id,
             "task_id": run.task_id,
-            "result": run.result,
+            "result": self._callback_result(run.result),
             "error": run.error,
         }
         with run.delivery_condition:
