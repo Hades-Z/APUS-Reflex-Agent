@@ -186,6 +186,11 @@ class Session:
         self.id = session_id
         self._cwd = cwd or harness._cwd
         self._agent_preset = agent_preset
+        # Highest native sequence this Session has returned, per source
+        # session. A source session absent here has not been read before, so
+        # its initialization events can still arrive ahead of this run's inbox
+        # receipt; once it has a prefix, everything it sends is a later run's.
+        self._last_seqs: dict[str, int] = {}
 
     @property
     def cwd(self) -> str:
@@ -205,18 +210,60 @@ class Session:
         content_blocks = normalize_input(input)
         notifications: list[Notification] = []
         events: list[JsonObject] = []
+        # Notifications this Session returned before this run, per source
+        # session. See ``_last_seqs``: a source session not listed here is
+        # still unread, so its initialization events belong to this run.
+        returned = dict(self._last_seqs)
+        seen: set[tuple[str, int]] = set()
+        pending: list[Notification] = []
+        observed: dict[str, int] = {}
 
         def collect(notification: Notification) -> None:
+            event = (
+                notification.payload.get("event")
+                if notification.method == "session.event"
+                else None
+            )
+            if isinstance(event, dict):
+                source_id = notification.payload.get("sessionId")
+                seq = event.get("seq")
+                if isinstance(source_id, str) and isinstance(seq, int):
+                    if seq <= returned.get(source_id, -1) or (source_id, seq) in seen:
+                        return
+                    seen.add((source_id, seq))
+                    observed[source_id] = max(observed.get(source_id, -1), seq)
             notifications.append(notification)
             if on_notification is not None:
                 on_notification(notification)
             if (
-                notification.method == "session.event"
+                isinstance(event, dict)
                 and notification.payload.get("sessionId") == self.id
             ):
+                events.append(event)
+
+        def claim_before_receipt(buffered: list[Notification]) -> list[Notification]:
+            """Return the buffered notifications this run owns, in arrival order.
+
+            A source session this Session has not returned events for yet is
+            starting here, so its initialization events belong to this run.
+            Every other notification seen before the receipt belongs to an
+            earlier run: this run's own replies, status, and subagents are all
+            appended after its splice.
+            """
+            claimed: list[Notification] = []
+            for notification in buffered:
+                if notification.method != "session.event":
+                    continue
+                source_id = notification.payload.get("sessionId")
                 event = notification.payload.get("event")
-                if isinstance(event, dict):
-                    events.append(event)
+                seq = event.get("seq") if isinstance(event, dict) else None
+                if (
+                    isinstance(source_id, str)
+                    and isinstance(seq, int)
+                    and source_id not in returned
+                ):
+                    claimed.append(notification)
+            return claimed
 
         with self.harness.client.subscribe_session_notifications(
             self.id
@@ -235,8 +282,12 @@ class Session:
                 notification = subscription.next()
                 if not received:
                     if not _is_inbox_receipt(notification, self.id, message_id):
+                        pending.append(notification)
                         continue
                     received = True
+                    for buffered in claim_before_receipt(pending):
+                        collect(buffered)
+                    pending.clear()
                 collect(notification)
                 if (
                     notification.method == "session.status"
@@ -245,13 +296,16 @@ class Session:
                 ):
                     break
 
-        return RunResult(
+        result = RunResult(
             session_id=self.id,
             final_response=final_response(events),
             finish_reason=finish_reason(events),
             events=events,
             notifications=notifications,
         )
+        for source_id, seq in observed.items():
+            self._last_seqs[source_id] = max(self._last_seqs.get(source_id, -1), seq)
+        return result
 
 
 def _is_inbox_receipt(

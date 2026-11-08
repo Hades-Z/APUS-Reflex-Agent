@@ -41,6 +41,10 @@
  * - `FAKE_CANCEL_ERROR`: answer `session/cancel` with a JSON-RPC error response.
  * - `FAKE_CANCEL_UNCONFIRMED`: answer `session/cancel` with `{ cancelled: false }`.
  * - `FAKE_RECORD_CANCELS`: append each `session/cancel` sessionId to this file.
+ * - `FAKE_PRE_RECEIPT_EVENTS`: comma list of `source:type` entries published
+ *   before this prompt's inbox receipt — `self` for this session, another id
+ *   for an unrelated one. A source session that already ran sees a stale tail
+ *   here instead, which the client must not attribute to this run.
  * - `FAKE_EXIT_DURING_PROMPT`: commit one interrupted assistant message, then
  *   exit 17 while the owned session run is waiting for its terminal state.
  * - `FAKE_STREAM_THEN_MALFORMED`: commit a partial assistant attempt for the
@@ -273,6 +277,17 @@ reader.on('line', (line) => {
     case 'session/prompt': {
       if (env.FAKE_RECORD_PROMPTS !== undefined) appendFileSync(env.FAKE_RECORD_PROMPTS, `${JSON.stringify(frame.params)}\n`)
       const sessionId = sessionIdOf(frame.params)
+      // Initialization events published before this prompt's inbox receipt.
+      // A fresh source session sends them here; a session that already ran
+      // sends a stale tail instead, which the client must not attribute to
+      // this run.
+      if (env.FAKE_PRE_RECEIPT_EVENTS !== undefined) {
+        for (const entry of env.FAKE_PRE_RECEIPT_EVENTS.split(',').filter(part => part.length > 0)) {
+          const [source, type] = entry.split(':', 2)
+          if (source === undefined || type === undefined) continue
+          event(source === 'self' ? sessionId : source, type, {})
+        }
+      }
       const messageId = `fake-user-${seq}`
       event(sessionId, 'agent/inbox/spliced', {
         target: 'next-turn',

@@ -179,6 +179,9 @@ export class HarnessSession {
    * @param harness - the owning harness (supplies the client and handshake).
    * @param id - the wire session id this handle runs on.
    */
+  /** Highest native sequence already returned, per source session. */
+  private readonly returnedSequences = new Map<string, number>()
+
   constructor(readonly harness: DeepSeekHarness, readonly id: string) {}
 
   /**
@@ -194,9 +197,26 @@ export class HarnessSession {
     const contentBlocks = normalizeInput(input)
     const events: SessionEvent[] = []
     const notifications: HarnessNotification[] = []
+    // Highest native sequence this session handle has returned, per source
+    // session. A source absent here has never been read, so its
+    // initialization events can still arrive ahead of this run's inbox
+    // receipt; once it has a prefix, anything earlier belongs to a later view
+    // of an earlier run.
+    const returned = new Map(this.returnedSequences)
+    const seen = new Set<string>()
+    const observed = new Map<string, number>()
 
     const subscription = client.subscribeSessionTree(this.id)
     const collect = (notification: HarnessNotification): void => {
+      if (notification.method === 'session.event') {
+        const source = notification.params.sessionId
+        const seq = typeof source === 'string' ? eventSequence(notification.params.event) : undefined
+        if (typeof source === 'string' && seq !== undefined) {
+          if (seq <= (returned.get(source) ?? -1) || seen.has(`${source}:${seq}`)) return
+          seen.add(`${source}:${seq}`)
+          observed.set(source, Math.max(observed.get(source) ?? -1, seq))
+        }
+      }
       if (notification.method === 'session.event' && notification.params.sessionId === this.id) {
         // Wire boundary: the envelope feeds the typed RunResult, so a
         // malformed runtime surfaces as a protocol error, not as type-invalid
@@ -210,6 +230,11 @@ export class HarnessSession {
       notifications.push(notification)
       options?.onNotification?.(notification)
     }
+    // Notifications seen before this prompt's receipt. A source session this
+    // handle has not returned events for is starting here, so its
+    // initialization events belong to this run; every other notification is
+    // an earlier run's reply, status or subagent tail.
+    const pending: HarnessNotification[] = []
     try {
       const messageId = await client.prompt(this.id, contentBlocks, {
         ...options?.cwd === undefined ? {} : { cwd: options.cwd },
@@ -221,8 +246,23 @@ export class HarnessSession {
         if (!received) {
           if (notification.method !== 'session.event'
             || notification.params.sessionId !== this.id
-            || !isInboxReceipt(notification.params.event, messageId)) continue
+            || !isInboxReceipt(notification.params.event, messageId)) {
+            pending.push(notification)
+            continue
+          }
           received = true
+          for (const buffered of pending) {
+            if (buffered.method !== 'session.event') continue
+            const source = buffered.params.sessionId
+            // Only a sequenced event identifies a native fact: a source that
+            // has not been read yet can send its setup before this receipt,
+            // while an unsequenced one carries no identity to attribute.
+            if (typeof source !== 'string') continue
+            if (eventSequence(buffered.params.event) === undefined) continue
+            if (returned.has(source)) continue
+            collect(buffered)
+          }
+          pending.length = 0
         }
         collect(notification)
         if (notification.method === 'session.status'
@@ -233,6 +273,11 @@ export class HarnessSession {
       subscription.close()
     }
 
+    // Advance the prefix only once the result is actually handed back: a run
+    // that throws must not make its events unclaimable for the next caller.
+    for (const [source, seq] of observed) {
+      this.returnedSequences.set(source, Math.max(this.returnedSequences.get(source) ?? -1, seq))
+    }
     return {
       sessionId: this.id,
       finalResponse: finalResponse(events),
@@ -304,6 +349,13 @@ function validatedSessionEvent(value: unknown): SessionEvent {
 }
 
 /** Whether a raw session event is the logged enqueue receipt for `messageId`. */
+/** The event's native sequence, when the wire carries one. */
+function eventSequence(value: unknown): number | undefined {
+  if (!isRecord(value)) return undefined
+  const seq = value.seq
+  return typeof seq === 'number' && Number.isSafeInteger(seq) ? seq : undefined
+}
+
 function isInboxReceipt(value: unknown, messageId: string): boolean {
   if (!isRecord(value) || value.type !== 'agent/inbox/spliced' || !isRecord(value.data)) return false
   const inserted = value.data.inserted

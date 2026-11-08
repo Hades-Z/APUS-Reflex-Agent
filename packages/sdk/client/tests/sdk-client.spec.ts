@@ -714,6 +714,36 @@ describe('wire payload validation', () => {
     await expect(harness.run('bad-reason')).rejects.toThrow(SdkProtocolError)
   })
 
+  it('returns initialization events published before the inbox receipt', async () => {
+    const harness = harnessWith({ FAKE_PRE_RECEIPT_EVENTS: 'self:permission/preset,self:approval/policy' })
+    const session = new HarnessSession(harness, 'owned')
+    const result = await session.run('first turn')
+    // Both setup events precede this prompt's splice on the wire; a client that
+    // discards everything before the receipt loses the session's own setup.
+    expect(result.events.map(event => event.type).slice(0, 2))
+      .toEqual(['permission/preset', 'approval/policy'])
+    expect(result.events.some(event => event.type === 'turn/end')).toBe(true)
+  })
+
+  it('does not replay an earlier run tail as the next run initialization', async () => {
+    const harness = harnessWith({ FAKE_PRE_RECEIPT_EVENTS: 'self:permission/preset' })
+    const session = new HarnessSession(harness, 'owned')
+    const first = await session.run('first turn')
+    expect(first.events.some(event => event.type === 'permission/preset')).toBe(true)
+    const second = await session.run('second turn')
+    // The same source already published its prefix in the first run, so the
+    // second run must not attribute the repeated setup to itself.
+    expect(second.events.some(event => event.type === 'permission/preset')).toBe(false)
+    expect(second.events.filter(event => event.type === 'turn/end')).toHaveLength(1)
+  })
+
+  it('does not claim an unrelated session notification before the receipt', async () => {
+    const harness = harnessWith({ FAKE_PRE_RECEIPT_EVENTS: 'other-session:permission/preset' })
+    const result = await new HarnessSession(harness, 'owned').run('go')
+    expect(result.events.some(event => event.type === 'permission/preset')).toBe(false)
+    expect(result.events.some(event => event.type === 'turn/end')).toBe(true)
+  })
+
   it('accepts the complete hook cancellation cause', async () => {
     const harness = harnessWith({ FAKE_REASON_KIND: 'aborted', FAKE_ABORT_REASON_KIND: 'hook' })
     const result = await harness.run('hook-abort')
