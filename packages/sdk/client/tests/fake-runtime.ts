@@ -315,7 +315,7 @@ reader.on('line', (line) => {
       const sessionId = sessionIdOf(frame.params)
       const key = `${sessionId}:${String(frame.params?.dispatchSeq)}`
       const view = viewScript.views?.[key]
-      if (view === undefined) {
+      if (view === undefined || view === null) {
         write({ jsonrpc: '2.0', id: frame.id, error: { code: -32603, message: 'dispatch not found', data: { code: 'DISPATCH_NOT_FOUND' } } })
         return
       }

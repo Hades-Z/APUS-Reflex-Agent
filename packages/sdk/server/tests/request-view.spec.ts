@@ -17,6 +17,7 @@ import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
 import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
@@ -212,7 +213,7 @@ describe('llm/stream dispatch facts', () => {
       const agent = await ctx.agentLoop.create(SessionId('dispatch-retry'), { provider: 'mock', model: 'mock' })
       let retried = false
       ctx.on('agent/request-error', () => {
-        if (retried) return
+        if (retried) return Promise.resolve(undefined)
         retried = true
         return Promise.resolve({ kind: 'retry' as const })
       })
@@ -528,7 +529,7 @@ describe('buildRequestView', () => {
         content: [{
           type: 'image',
           attachment: {
-            attachmentId: 'sha256:request-view',
+            attachmentId: AttachmentId('sha256:request-view'),
             mediaType: 'image/png',
             bytes: 1,
             width: 1,
