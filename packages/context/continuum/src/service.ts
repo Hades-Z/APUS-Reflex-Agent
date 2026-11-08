@@ -35,6 +35,8 @@ export interface ContinuumConfig extends ContinuumMemoryContextConfig {
   readonly admission?: ContinuumAdmissionMode
   readonly candidatePool?: MemoryCandidatePool
   readonly maxPool?: number
+  /** Record retrieval audit events; the schema supplies `false` when omitted. */
+  readonly trace?: boolean
 }
 
 /** Which human messages become memory records without an explicit caller. */
