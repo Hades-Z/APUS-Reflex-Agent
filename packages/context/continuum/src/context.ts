@@ -148,6 +148,7 @@ export function installContinuumMemoryContext(
   config: ContinuumMemoryContextConfig,
 ): () => void {
   let active = true
+  const budget = retrievalBudget(config)
   const isActive = (): boolean => active
   const stop = ctx.on('agent/pre-step', async ({ agent, messages, signal }, next): Promise<PreStepDecision> => {
     const decision = await next()
@@ -157,8 +158,8 @@ export function installContinuumMemoryContext(
     if (store === undefined || query === undefined) return decision
     signal.throwIfAborted()
     const traced = config.trace === true
-    const outcome = traced ? retrieveMemoryWorkingSetWithReport(store, config, query) : undefined
-    const workingSet = outcome?.workingSet ?? retrieveMemoryWorkingSet(store, config, query)
+    const outcome = traced ? retrieveMemoryWorkingSetWithReport(store, budget, query) : undefined
+    const workingSet = outcome?.workingSet ?? retrieveMemoryWorkingSet(store, budget, query)
     if (traced && outcome !== undefined) {
       recordMemoryRetrieval(retrievalRecorder(ctx, agent), {
         query, limits: retrievalLimits(config), selectorMounted: false, report: outcome.report,
@@ -199,6 +200,7 @@ export function installContinuumMemoryControllerContext(
   tagsOf: (agent: Agent, id: MemoryId) => readonly string[] = () => [],
 ): () => void {
   let active = true
+  const budget = retrievalBudget(config)
   const isActive = (): boolean => active
   const stop = ctx.on('agent/pre-step', async ({ agent, messages, signal }, next): Promise<PreStepDecision> => {
     const decision = await next()
@@ -215,8 +217,8 @@ export function installContinuumMemoryControllerContext(
     if (ticket === undefined) return decision
     const selector = selectorOf()
     const traced = config.trace === true
-    const requestedLimits = selector === undefined ? config : {
-      ...config, maxCandidates: config.maxPool ?? config.maxCandidates, maxTotalBytes: Number.MAX_SAFE_INTEGER,
+    const requestedLimits = selector === undefined ? budget : {
+      ...budget, maxCandidates: config.maxPool ?? config.maxCandidates, maxTotalBytes: Number.MAX_SAFE_INTEGER,
     }
     const outcome = traced ? controller.readWithReport(ticket, requestedLimits, query) : undefined
     const workingSet = outcome?.workingSet ?? controller.read(ticket, requestedLimits, query)
@@ -287,6 +289,12 @@ export function installContinuumMemoryControllerContext(
     stop()
   })
   return () => { void dispose() }
+}
+
+/** Numeric retrieval budgets only; the observation switch must not reach budget validation. */
+function retrievalBudget(config: ContinuumMemoryContextConfig): Omit<ContinuumMemoryContextConfig, 'trace'> {
+  const { trace: _trace, ...budget } = config
+  return budget
 }
 
 /** Session log and warning sink for one read's retrieval events. */

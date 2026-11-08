@@ -63,6 +63,8 @@ export const ContinuumConfigFields = {
   maxExcerptBytes: z.number().step(1).min(1).default(2048),
   maxTotalBytes: z.number().step(1).min(1).default(8192),
   maxPool: z.number().step(1).min(1).default(8),
+  /** Record retrieval audit events; configurable independently of the feature switch, never a numeric budget. */
+  trace: z.boolean().default(false),
 }
 
 /** Schemastery validation for {@link ContinuumConfig}. */
@@ -142,6 +144,7 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
       const retrievalConfig = {
         maxCandidates: config.maxCandidates, maxExcerptBytes: config.maxExcerptBytes, maxTotalBytes: config.maxTotalBytes,
         candidatePool: config.candidatePool, maxPool: config.maxPool, admission: config.admission ?? 'explicit',
+        trace: config.trace,
       }
       installContinuumMemoryControllerContext(ctx, agent => this.reflexReady() ? this.projectionFor(agent, {
         enabled: readSetting(config.enabled), mode: readSetting(config.mode), reflexMounted: ctx.get('jev') !== undefined,

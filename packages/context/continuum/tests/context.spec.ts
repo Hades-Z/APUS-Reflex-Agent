@@ -3,7 +3,7 @@ import { agentEvents } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, onTestFinished } from 'vitest'
 import { ContinuumMemoryController, MemoryId, MemoryRecordStore, installContinuumMemoryContext, installContinuumMemoryControllerContext } from '../src/index.ts'
-import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
+import { Session, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
 function records(): MemoryRecordStore {
@@ -79,6 +79,38 @@ describe('Continuum same-step context consumer', () => {
       messages: [user], turn: 1, step: 1, signal: new AbortController().signal,
     }, async () => ({ kind: 'enter' as const, messages: [user] }))
     expect(result.kind === 'enter' ? result.messages : []).toEqual([user])
+  })
+
+  it('records retrieval audit events for the direct consumer without treating trace as a budget', async () => {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    const session = Session.create(SessionId('trace-direct'))
+    installContinuumMemoryContext(ctx, () => records(), { maxCandidates: 2, maxExcerptBytes: 100, maxTotalBytes: 512, trace: true })
+    const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'When is the migration scheduled?' }] })
+    const result = await agentEvents(ctx, { session } as Agent).waterfall('agent/pre-step', {
+      messages: [user], turn: 1, step: 1, signal: new AbortController().signal,
+    }, () => Promise.resolve({ kind: 'enter' as const, messages: [user] }))
+    expect(result.kind === 'enter' ? result.messages : []).toHaveLength(2)
+    const types = session.snapshotEvents().map(event => event.type)
+    expect(types).toContain('continuum/memory-retrieval')
+    expect(types).toContain('continuum/memory-injected')
+  })
+
+  it('records controller retrieval audit events without a selector when trace is enabled', async () => {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    const session = Session.create(SessionId('trace-controller'))
+    const controller = new ContinuumMemoryController(records(), { enabled: true, mode: 'active', reflexMounted: true })
+    installContinuumMemoryControllerContext(ctx, () => controller, () => ({ scopes: ['workspace'] }),
+      { maxCandidates: 2, maxExcerptBytes: 100, maxTotalBytes: 512, trace: true })
+    const user = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'When is the migration scheduled?' }] })
+    const result = await agentEvents(ctx, { session } as Agent).waterfall('agent/pre-step', {
+      messages: [user], turn: 1, step: 1, signal: new AbortController().signal,
+    }, () => Promise.resolve({ kind: 'enter' as const, messages: [user] }))
+    expect(result.kind === 'enter' ? result.messages : []).toHaveLength(2)
+    const types = session.snapshotEvents().map(event => event.type)
+    expect(types).toContain('continuum/memory-retrieval')
+    expect(types).toContain('continuum/memory-injected')
   })
 
   it('does not inject when no per-agent store is available', async () => {
