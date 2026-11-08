@@ -53,6 +53,7 @@ export interface Config {
   maxSourceBytes?: number
   instructionFileCandidates?: string[]
   localInstructionFileCandidates?: string[]
+  hostInstructionRoots?: string[]
 }
 ```
 
