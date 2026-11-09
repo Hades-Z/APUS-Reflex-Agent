@@ -70,18 +70,20 @@
                   sampleOverCapGlobResults: false
               - id: tool-bash
                 name: '@deepseek-ai/dsh-tool-bash'
-              # Task rules and skills load through the same isolated world that
-              # owns the remote tools, so the agent's /app AGENTS.md and
-              # project skills resolve inside its container by agent identity.
-              - id: agent-instructions
-                name: '@deepseek-ai/dsh-agent-instructions'
-                config:
-                  instructionFileCandidates: ['AGENTS.md', 'CLAUDE.md']
-                  maxBytes: 32768
-              - id: skill-filesystem
-                name: '@deepseek-ai/dsh-skill-filesystem'
-                config:
-                  includeDefaultRoots: false
+
+    # Task rules and skills. Mounted outside the isolated tool group: the
+    # compose reads through the context's own filesystem provider, and inside
+    # the remote-isolated group the pre-step agent identity does not reach
+    # the remote resolve, which kills the turn before the model is called.
+    - id: agent-instructions
+      name: '@deepseek-ai/dsh-agent-instructions'
+      config:
+        instructionFileCandidates: ['AGENTS.md', 'CLAUDE.md']
+        maxBytes: 32768
+    - id: skill-filesystem
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        includeDefaultRoots: false
 
     # Jev decides; the harness records what it decided.
     - id: jev
