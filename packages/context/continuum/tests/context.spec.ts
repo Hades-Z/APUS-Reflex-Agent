@@ -200,6 +200,8 @@ describe('Continuum same-step context consumer', () => {
     const disabled = new ContinuumMemoryController(records(), { enabled: false, mode: 'off', reflexMounted: false })
     const empty = new ContinuumMemoryController(new MemoryRecordStore(), { enabled: true, mode: 'active', reflexMounted: true })
     const active = new ContinuumMemoryController(records(), { enabled: true, mode: 'active', reflexMounted: true })
+    // A profile with no controller left the feature off: it records no
+    // judgement at all, so its log carries no Continuum facts.
     current = undefined; expect(await ask(1, [user])).toHaveLength(1)
     current = active; expect(await ask(2, [])).toHaveLength(0)
     current = disabled; expect(await ask(3, [user])).toHaveLength(1)
@@ -208,9 +210,9 @@ describe('Continuum same-step context consumer', () => {
     current = active; expect(await ask(6, [user])).toHaveLength(2)
     const decisions = recallDecisions(session)
     expect(decisions.map(decision => decision.reason))
-      .toEqual(['no-controller', 'no-query', 'unavailable', 'empty-store', 'no-candidates', 'injected'])
+      .toEqual(['no-query', 'unavailable', 'empty-store', 'no-candidates', 'injected'])
     expect(decisions[4]?.activeRecords).toBe(1)
-    expect(decisions[5]).toMatchObject({ turn: 6, outcome: 'injected', querySource: 'latest-user-message', injectedRecords: 1 })
+    expect(decisions[4]).toMatchObject({ turn: 6, outcome: 'injected', querySource: 'latest-user-message', injectedRecords: 1 })
   })
 
   it('injects only candidates that share a query term when no selector is mounted', async () => {

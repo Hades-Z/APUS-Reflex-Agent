@@ -250,7 +250,10 @@ export function installContinuumMemoryControllerContext(
       if (!isActive()) { note('consumer-inactive'); return decision }
       if (decision.kind === 'reject') { note('step-rejected'); return decision }
       const controller = controllerOf(agent)
-      if (controller === undefined) { note('no-controller'); return decision }
+      // No controller means this profile left the feature off: there is no
+      // recall judgement to record, so the log stays free of Continuum facts
+      // until a live enablement installs one.
+      if (controller === undefined) return decision
       if (query === undefined) { note('no-query'); return decision }
       signal.throwIfAborted()
       const pending = pendingOf(agent)
