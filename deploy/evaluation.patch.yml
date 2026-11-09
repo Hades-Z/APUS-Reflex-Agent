@@ -70,6 +70,17 @@
                   sampleOverCapGlobResults: false
               - id: tool-bash
                 name: '@deepseek-ai/dsh-tool-bash'
+              # Task rules and skills load through the same isolated world that
+              # owns the remote tools, so the agent's /app AGENTS.md and
+              # project skills resolve inside its container by agent identity.
+              - id: agent-instructions
+                name: '@deepseek-ai/dsh-agent-instructions'
+                config:
+                  instructionFileCandidates: ['AGENTS.md', 'CLAUDE.md']
+              - id: skill-filesystem
+                name: '@deepseek-ai/dsh-skill-filesystem'
+                config:
+                  includeDefaultRoots: false
 
     # Jev decides; the harness records what it decided.
     - id: jev
