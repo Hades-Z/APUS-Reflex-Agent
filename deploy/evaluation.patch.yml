@@ -77,6 +77,7 @@
                 name: '@deepseek-ai/dsh-agent-instructions'
                 config:
                   instructionFileCandidates: ['AGENTS.md', 'CLAUDE.md']
+                  maxBytes: 32768
               - id: skill-filesystem
                 name: '@deepseek-ai/dsh-skill-filesystem'
                 config:
