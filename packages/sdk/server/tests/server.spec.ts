@@ -1251,11 +1251,12 @@ describe('HarnessSdkJsonRpcServer', () => {
   it('stops a running agent, then settles, flushes, and only then disposes it on shutdown', async () => {
     const order: string[] = []
     const session = { id: SessionId('owned') } as unknown as Agent['session']
+    const cancel = vi.fn(() => { order.push('cancel') })
     const agent = ({
       id: SessionId('owned'),
       session,
       status: 'running',
-      cancel: vi.fn(() => { order.push('cancel') }),
+      cancel,
       whenIdle: vi.fn(async () => { order.push('whenIdle') }),
     } as unknown) as Agent
     const continuumMemory = {
@@ -1289,7 +1290,7 @@ describe('HarnessSdkJsonRpcServer', () => {
     // the session and recorder are still mounted; settlement and durability
     // follow, and disposal is last.
     expect(order).toEqual(['cancel', 'whenIdle', 'settled', 'flush', 'dispose'])
-    expect((agent.cancel as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith({ kind: 'disposed' })
+    expect(cancel).toHaveBeenCalledWith({ kind: 'disposed' })
     expect(continuumMemory.whenSettled).toHaveBeenCalledWith(agent)
   })
 

@@ -502,10 +502,16 @@ export class HarnessSdkJsonRpcServer {
       const timer = setTimeout(() => {
         reject(new Error(`session "${sessionId}" did not settle and flush within ${timeoutMs}ms`))
       }, timeoutMs)
-      timer.unref?.()
+      timer.unref()
       work.then(
         (value) => { clearTimeout(timer); resolve(value) },
-        (error: unknown) => { clearTimeout(timer); reject(error) },
+        (error: unknown) => {
+          clearTimeout(timer)
+          // The barrier's own rejection is the caller-visible failure: it may
+          // carry an arbitrary value from a listener, so it is preserved
+          // verbatim rather than wrapped.
+          reject(error)
+        },
       )
     })
   }
@@ -540,7 +546,9 @@ export class HarnessSdkJsonRpcServer {
         ? sessions as { get(id: SessionId): Session | undefined; flush(session: Session): Promise<unknown> }
         : undefined
       const live = store?.get(SessionId(sessionId))
-      if (live !== undefined) await this.withSettlementDeadline(Promise.resolve(store.flush(live)), sessionId)
+      if (store !== undefined && live !== undefined) {
+        await this.withSettlementDeadline(Promise.resolve(store.flush(live)), sessionId)
+      }
     })().finally(() => {
       // Only this pass may retire its own entry: a later turn can have
       // installed a newer pass after a running transition.

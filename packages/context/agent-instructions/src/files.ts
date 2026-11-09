@@ -318,11 +318,17 @@ async function discoverInstructionFiles(
     files.push(file)
   }
 
-  // The user-global rule is the fixed read-only Host resource of this loader:
-  // it belongs to the harness installation, not to the agent's task container,
-  // so it is probed without an agent and never resolved inside that world.
+  // The user-global rule is a fixed read-only Host resource of this loader: it
+  // belongs to the harness installation, not to the agent's task container.
+  // A provider that can read Host paths keeps serving it (its reads are what
+  // the product records); a task-container provider cannot, and asking it needs
+  // an agent id this file does not have — it would reject the whole turn.
   const userGlobal = join(config.dshHome, USER_GLOBAL_FILE)
-  const userGlobalProbe = await statFile(userGlobal, fileSystem, undefined, options.signal)
+  const userGlobalLocal = fileSystem === undefined
+    || fileSystem.processPathFromHostPath(userGlobal) === undefined
+  const userGlobalProbe = userGlobalLocal
+    ? await nodeStatFile(userGlobal, options.signal)
+    : await statFile(userGlobal, fileSystem, undefined, options.signal)
   switch (userGlobalProbe.kind) {
     case 'present':
       addFile({
@@ -552,13 +558,23 @@ export async function probeScopeInstruction(
   // resolve() follows a final-component symlink; stat then classifies the target.
   // A non-file target (missing, or a link to a directory) is a confirmed absence;
   // only a provider exception is reported as unavailable.
-  // A fixed Host rule root is a Host resource: this process stats it directly,
-  // exactly as it read the candidate during baseline discovery, so a later
-  // reconciliation cannot route it through the agent's execution world.
+  //
+  // Both a fixed Host rule root and the user-global rule are Host resources:
+  // their files live in this process, not in the Agent's task container. Asking
+  // the remote provider for them needs an agent id they do not have, and the
+  // deployment rejects the whole turn before any model call. This process
+  // therefore stats them directly, exactly as it read the candidate during
+  // baseline discovery.
+  // The user-global rule is Host-owned like a fixed Host rule root, unless the
+  // provider can read Host paths itself (a Host-backed or explicitly shared
+  // backend), in which case its reads stay the recorded source.
+  const hostOwned = hostRoot !== undefined
+    || (directory === USER_GLOBAL_DIRECTORY
+      && (fileSystem.processPathFromHostPath(absolutePath) === undefined))
   let target: FsTarget | undefined
   let info: FsInfo | undefined
   try {
-    if (hostRoot !== undefined) {
+    if (hostOwned) {
       const probe = await nodeStatFile(absolutePath, signal)
       if (probe.kind === 'unavailable') return { kind: 'unavailable' }
       if (probe.kind === 'absent') return { kind: 'absent' }
@@ -569,10 +585,7 @@ export async function probeScopeInstruction(
         ...probe.info.size === undefined ? {} : { size: probe.info.size },
       }
     } else {
-      target = await fileSystem.resolve(absolutePath, resolutionOptions(
-        directory === USER_GLOBAL_DIRECTORY ? undefined : agentId,
-        signal,
-      ))
+      target = await fileSystem.resolve(absolutePath, resolutionOptions(agentId, signal))
       info = await fileSystem.stat(target, signal)
     }
   } catch {

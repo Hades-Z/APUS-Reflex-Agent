@@ -186,13 +186,13 @@ describe.skipIf(process.platform === 'win32')('task-world instruction loading', 
       const text = await instructionContext(ctx, agent)
       expect(text).toContain('Task rule: answer in the task container.')
       expect(fs.resolveCalls.length).toBeGreaterThan(0)
-      // Task paths name the agent; the fixed user-global Host rule names none.
+      // Task paths name the agent. The user-global rule is a Host resource and
+      // is read on this host, so it never reaches the task world at all.
       const taskCalls = fs.resolveCalls.filter(call => call.path === '/app' || call.path.startsWith('/app/'))
       expect(taskCalls.length).toBeGreaterThan(0)
       expect(taskCalls.every(call => call.agentId === 'instruction-case-a')).toBe(true)
-      expect(fs.resolveCalls.filter(call => call.agentId === undefined)).toEqual([
-        { path: join(dshHome, 'AGENTS.md'), agentId: undefined },
-      ])
+      expect(fs.resolveCalls.filter(call => call.agentId === undefined)).toEqual([])
+      expect(fs.resolveCalls.some(call => call.path === join(dshHome, 'AGENTS.md'))).toBe(false)
     } finally {
       await ctx.fiber.dispose()
     }
@@ -289,6 +289,34 @@ describe.skipIf(process.platform === 'win32')('task-world instruction loading', 
       expect(taskCalls.length).toBeGreaterThan(0)
       expect(taskCalls.every(call => call.path.startsWith('/app'))).toBe(true)
       expect(fs.resolveCalls.every(call => call.path !== join(hostRoot, 'AGENTS.md'))).toBe(true)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+})
+
+describe('user-global rules under an agent-scoped task filesystem', () => {
+  /**
+   * `$DSH_HOME/AGENTS.md` is this process's own file, not the task container's.
+   * Asking the remote filesystem for it needs an agent id the file does not
+   * have — the deployment then rejects the whole turn with "the request names
+   * no agent" before any model call.
+   */
+  it('reads the user-global rule from this process without asking the task world', async () => {
+    const root = await tempDir('instruction-global-world')
+    await mkdir(join(root, '.git'), { recursive: true })
+    await writeFile(join(root, 'AGENTS.md'), 'Task rule.\n')
+    const { ctx, fs, dshHome, create } = await harness()
+    try {
+      await writeFile(join(dshHome, 'AGENTS.md'), 'User-global rule.\n')
+      fs.worlds.set('instruction-global-agent', root)
+      const agent = await create('instruction-global-agent', '/app')
+      const text = await instructionContext(ctx, agent)
+      expect(text).toContain('User-global rule.')
+      expect(text).toContain('Task rule.')
+      // Every world call names an agent; a Host file is never routed into the task container.
+      expect(fs.resolveCalls.every(call => call.agentId !== undefined)).toBe(true)
+      expect(fs.resolveCalls.some(call => call.path === join(dshHome, 'AGENTS.md'))).toBe(false)
     } finally {
       await ctx.fiber.dispose()
     }

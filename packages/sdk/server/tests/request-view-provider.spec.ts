@@ -48,11 +48,13 @@ it('replays each native view into the exact messages and tools captured at the g
     })
   })
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
-  cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())))
+  cleanups.push(() => new Promise<void>((resolve, reject) => {
+    server.close((error) => { if (error === undefined) resolve(); else reject(error) })
+  }))
   const address = server.address()
   if (address === null || typeof address === 'string') throw new Error('受控提供方未取得本地端口')
   const directory = await mkdtemp(join(tmpdir(), 'dsh-provider-view-'))
-  cleanups.push(() => rm(directory, { recursive: true, force: true }))
+  cleanups.push(async () => { await rm(directory, { recursive: true, force: true }) })
   const ctx = new Context()
   cleanups.push(() => ctx.fiber.dispose())
   await mountAgentLoopTestDependencies(ctx)
@@ -97,9 +99,12 @@ it('replays each native view into the exact messages and tools captured at the g
       sessionId: agent.session.id, dispatchSeq: dispatch.seq,
       projections: currentSessionMessageProjections,
     })
+    // 视图的 header 已经携带实际 provider/model；重复写默认值会让类型检查
+    // 判断后者覆盖前者，且可能掩盖真正生效的配置。
     const replay = {
-      provider: 'gateway', model: 'deepseek-v4.1-flash', ...view.header.config,
-      messages: [...view.messages], tools: view.tools, toolHistory: view.toolHistory,
+      ...view.header.config,
+      messages: [...view.messages], toolHistory: view.toolHistory,
+      ...(view.tools === undefined ? {} : { tools: view.tools }),
     }
     for await (const _chunk of ctx.llm.stream(replay)) { /* 消费受控响应，不触发真实模型。 */ }
     expect(bodies[index + 2]).toEqual(bodies[index])
