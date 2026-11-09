@@ -309,7 +309,7 @@ describe('Continuum compaction admission', () => {
     vi.spyOn(ContinuumMemoryController.prototype, 'observe').mockImplementation(() => { throw new Error('append failed') })
     await failing.compaction.compactNow(failing.agent, SIGNAL)
     await new Promise(resolve => setTimeout(resolve, 10))
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('continuum compaction admission failed: Error: append failed'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('continuum memory index observation failed: append failed'))
   })
 
   it('ignores checkpoints in the other admission modes', async () => {

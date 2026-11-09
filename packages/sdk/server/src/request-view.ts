@@ -100,6 +100,25 @@ export class RequestViewUnsupportedError extends Error {
   }
 }
 
+/**
+ * The installed dispatch recorder. Calling it removes every listener and pending
+ * observer; {@link RequestDispatchRecorder.whenSettled} waits for one Session's
+ * queued settlement records, which are appended from a microtask once the
+ * publishing append has unwound.
+ */
+export interface RequestDispatchRecorder {
+  /** Remove every listener and drop observers that never settled. */
+  (): void
+  /**
+   * Resolve after every settlement record this recorder can still append for
+   * one Session has been inserted. Waiting is per Session: another Session's
+   * unsettled dispatch never blocks this one.
+   * @param sessionId - the Session whose queue to drain.
+   * @returns a promise that resolves once no scheduled settlement remains.
+   */
+  whenSettled(sessionId: SessionId): Promise<void>
+}
+
 /** One dispatch observer, from the `llm/stream` boundary through settlement. */
 interface ActiveDispatch {
   readonly session: Session
@@ -123,20 +142,34 @@ type DispatchPosition = { readonly turn: number; readonly step: number }
  * @param ctx - context whose `llm/stream` waterfall and `sessions` store are observed.
  * @returns the disposer removing every listener and pending observer.
  */
-export function installRequestDispatchRecorder(ctx: Context): () => void {
+export function installRequestDispatchRecorder(ctx: Context): RequestDispatchRecorder {
   const store = ctx.get('sessions')
-  if (store === undefined) return () => undefined
+  if (store === undefined) return Object.assign(() => undefined, { whenSettled: () => Promise.resolve() })
   const positions = new Map<string, DispatchPosition>()
   const active = new Set<ActiveDispatch>()
+  /** Dispatches whose settlement record is due but not yet inserted. */
+  const pendingSettlements = new Set<ActiveDispatch>()
+  const settlementWaiters = new Set<{ readonly sessionId: SessionId; readonly resolve: () => void }>()
 
-  const appendSettled = (state: ActiveDispatch): void => {
-    if (state.settlementSeq === undefined) return
+  const pendingFor = (sessionId: SessionId): boolean =>
+    [...pendingSettlements].some(state => String(state.session.id) === String(sessionId))
+
+  const releaseWaiters = (sessionId: SessionId): void => {
+    if (pendingFor(sessionId)) return
+    for (const waiter of [...settlementWaiters]) {
+      if (String(waiter.sessionId) !== String(sessionId)) continue
+      settlementWaiters.delete(waiter)
+      waiter.resolve()
+    }
+  }
+
+  const appendSettled = (state: ActiveDispatch, settlementSeq: SessionSeq): void => {
     active.delete(state)
     try {
       state.session.append('llm/dispatch-settled', {
         sessionId: state.session.id,
         dispatchSeq: state.dispatchSeq,
-        settlementSeq: state.settlementSeq,
+        settlementSeq,
       })
     } catch (error: unknown) {
       ctx.logger.warn(`sdk request view: failed to record llm/dispatch-settled for "${String(state.session.id)}": ${String(error)}`)
@@ -149,20 +182,35 @@ export function installRequestDispatchRecorder(ctx: Context): () => void {
   const scheduleFlush = (state: ActiveDispatch): void => {
     if (state.flushScheduled) return
     state.flushScheduled = true
+    pendingSettlements.add(state)
     queueMicrotask(() => {
       state.flushScheduled = false
-      if (state.streamEnded) appendSettled(state)
+      // The record may only follow the settlement append that published it,
+      // and only once both facts exist. A stream that has not ended, or a
+      // settlement event that has not arrived yet, leaves this dispatch
+      // pending; its own later edge schedules the next flush, so a waiter is
+      // never released while the record it awaits is still missing.
+      const settlementSeq = state.settlementSeq
+      if (!state.streamEnded || settlementSeq === undefined) return
+      appendSettled(state, settlementSeq)
+      pendingSettlements.delete(state)
+      releaseWaiters(state.session.id)
     })
   }
 
   const disposers = [
     ctx.on('session/disposed', (session: Session) => {
       // The session left the store: its step position and any dispatch whose
-      // settlement never arrived must not outlive it.
+      // settlement never arrived must not outlive it. A scheduled settlement
+      // record is dropped with it, so a waiter cannot wait out its timeout.
       positions.delete(String(session.id))
       for (const state of active) {
         if (state.session === session) active.delete(state)
       }
+      for (const state of pendingSettlements) {
+        if (state.session === session) pendingSettlements.delete(state)
+      }
+      releaseWaiters(session.id)
     }),
     ctx.on('session/event', (session: Session, event: SessionEvent) => {
       if (event.type === 'step/start') {
@@ -222,11 +270,24 @@ export function installRequestDispatchRecorder(ctx: Context): () => void {
       })()
     }),
   ]
-  return () => {
+  const dispose = (): void => {
     for (const dispose of disposers) dispose()
     active.clear()
     positions.clear()
+    pendingSettlements.clear()
+    // Disposal drops the observers a waiter is waiting on, so no waiter may
+    // remain pending after this call.
+    for (const waiter of [...settlementWaiters]) {
+      settlementWaiters.delete(waiter)
+      waiter.resolve()
+    }
   }
+  return Object.assign(dispose, {
+    whenSettled(sessionId: SessionId): Promise<void> {
+      if (!pendingFor(sessionId)) return Promise.resolve()
+      return new Promise<void>((resolve) => { settlementWaiters.add({ sessionId, resolve }) })
+    },
+  })
 }
 
 /** Parameters of one {@link buildRequestView} query. */

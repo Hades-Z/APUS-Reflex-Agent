@@ -373,3 +373,33 @@ describe('Continuum Reflex admitter service', () => {
     expect(ctx.get('continuumMemoryAdmitter')).toBeUndefined()
   })
 })
+
+describe('Continuum admission receipt attribution', () => {
+  it('records which entry and write trigger a receipt belongs to', async () => {
+    const provider = fake([0.9, 0.9])
+    const receipts: unknown[] = []
+    const settle = admitContinuumMemory(provider, config, {
+      candidates: [memory('a')], subject: 'executed output', writeId: 'write-1',
+    })
+    const settled = await settle
+    receipts.push(settled)
+    expect(settled).toMatchObject({ origin: 'execution', writeId: 'write-1', phase: 'settled' })
+    // A compaction caller that names no trigger keeps the receipt free of a guessed write id.
+    const compaction = await admitContinuumMemory(provider, config, { candidates: [memory('b')], subject: 'user message' })
+    expect(compaction).toMatchObject({ origin: 'compaction' })
+    expect(compaction.writeId).toBeUndefined()
+  })
+
+  it('carries the same attribution into the prepared receipt that precedes dispatch', async () => {
+    const provider = fake([0.9])
+    let prepared: unknown
+    const settled = await admitContinuumMemory(provider, config, {
+      candidates: [memory('a')], subject: 'executed output', writeId: 'write-2',
+    }, undefined, async (receipt) => {
+      prepared = receipt
+      return SessionSeq(7)
+    })
+    expect(prepared).toMatchObject({ phase: 'prepared', origin: 'execution', writeId: 'write-2' })
+    expect(settled).toMatchObject({ phase: 'settled', origin: 'execution', writeId: 'write-2', preparedSeq: SessionSeq(7) })
+  })
+})

@@ -20,6 +20,7 @@ import type {
   InitializeParams,
   InitializeResult,
   JsonRpcTransportPeer,
+  SdkSessionSettlement,
   SessionCancelParams,
   SessionCancelResult,
   SessionDispatchesParams,
@@ -36,8 +37,23 @@ import type {
 } from '@deepseek-ai/dsh-sdk-protocol'
 import { SDK_REQUEST_VIEW_CAPABILITY } from '@deepseek-ai/dsh-sdk-protocol'
 import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
-import type { SessionEvent, SessionMessageProjection } from '@deepseek-ai/dsh-session'
-import { buildRequestView, installRequestDispatchRecorder, RequestViewError, RequestViewUnsupportedError } from './request-view.ts'
+import type { Session, SessionEvent, SessionMessageProjection } from '@deepseek-ai/dsh-session'
+import {
+  buildRequestView,
+  installRequestDispatchRecorder,
+  RequestViewError,
+  RequestViewUnsupportedError,
+  type RequestDispatchRecorder,
+} from './request-view.ts'
+
+/**
+ * The one Continuum surface this server needs: the promise that an Agent's
+ * queued observations have settled. Declared here structurally so the SDK
+ * server does not take a production dependency on the memory service.
+ */
+interface SettledObservations {
+  whenSettled(agent: Agent): Promise<void>
+}
 
 interface SessionRecord {
   handle: AgentHandle
@@ -94,6 +110,13 @@ export interface HarnessSdkJsonRpcServerOptions {
    * is refused instead of flattened.
    */
   requestViewProjections?: readonly SessionMessageProjection[]
+  /**
+   * Upper bound, in milliseconds, on waiting for one Agent's queued facts to
+   * settle and its Session log to flush. A barrier that exceeds it fails
+   * explicitly instead of hanging the cancel reply or process shutdown.
+   * Defaults to 30 seconds.
+   */
+  settlementTimeoutMs?: number
 }
 
 /** Validate the wire params of one `session/dispatches` request. */
@@ -143,7 +166,7 @@ export class HarnessSdkJsonRpcServer {
    */
   private readonly cancelGenerations = new Map<string, number>()
   private readonly disposers: (() => void)[] = []
-  private dispatchRecorderDispose: (() => void) | undefined
+  private dispatchRecorder: RequestDispatchRecorder | undefined
   private shutdownTask: Promise<Record<string, never>> | undefined
   private shuttingDown = false
   private initialized = false
@@ -155,14 +178,31 @@ export class HarnessSdkJsonRpcServer {
   ) {
     const serverOptions = this.options
     if (serverOptions.recordLlmDispatch === true) {
-      this.dispatchRecorderDispose = installRequestDispatchRecorder(ctx)
+      this.dispatchRecorder = installRequestDispatchRecorder(ctx)
     }
     this.disposers.push(ctx.on('session/event', (session, event) => {
       const payload: SessionEventNotification = { sessionId: String(session.id), event }
       this.transport.notify('session.event', payload)
     }))
     this.disposers.push(ctx.on('agent/status', ({ agent, status }) => {
-      this.transport.notify('session.status', { sessionId: String(agent.session.id), status })
+      const sessionId = String(agent.session.id)
+      const epoch = this.bumpStatusEpoch(sessionId)
+      // A settled idle is claimed only when some fact source can still be
+      // draining: the dispatch recorder's pending settlement records or the
+      // memory service's queued admissions. Without either the transition is
+      // forwarded exactly as observed.
+      if (status !== 'idle' || !this.hasSettlementSources()) {
+        if (status !== 'idle') {
+          this.idleAnnounced.delete(sessionId)
+          // A drain started for the previous idle covers only the facts queued
+          // then. New work owns a new pass, so a later `cancel` or idle cannot
+          // be answered by the stale one.
+          this.settledDrains.delete(agent)
+        }
+        this.transport.notify('session.status', { sessionId, status })
+        return
+      }
+      void this.announceSettledIdle(agent, sessionId, epoch)
     }))
     this.disposers.push(ctx.on('session/created', (session) => {
       const parentSession = session.header.parentSession
@@ -234,7 +274,7 @@ export class HarnessSdkJsonRpcServer {
     this.initialized = true
     return {
       serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' },
-      ...this.dispatchRecorderDispose === undefined ? {} : { capabilities: [SDK_REQUEST_VIEW_CAPABILITY] },
+      ...this.dispatchRecorder === undefined ? {} : { capabilities: [SDK_REQUEST_VIEW_CAPABILITY] },
     }
   }
 
@@ -312,7 +352,7 @@ export class HarnessSdkJsonRpcServer {
 
   /** Refuse read-only request views when this runtime recorded no dispatches. */
   private assertRequestViews(): void {
-    if (this.dispatchRecorderDispose === undefined) {
+    if (this.dispatchRecorder === undefined) {
       throw new Error('this SDK runtime does not support read-only request views; start it with recordLlmDispatch enabled')
     }
   }
@@ -407,9 +447,133 @@ export class HarnessSdkJsonRpcServer {
     }
     this.assertLiveAgent(rec, params.sessionId)
     rec.handle.agent.cancel({ kind: 'user' })
-    // Settlement, not the request above, is what this method reports.
+    // Settlement, not the request above, is what this method reports. The
+    // agent's own idle only drains its turn; observations queued at the last
+    // step boundary and their durable flush are the two facts a caller of
+    // cancel must be able to read back immediately. The status notification
+    // itself stays with the listener, which applies the same barrier.
     await rec.handle.agent.whenIdle()
+    await this.drainSettled(rec.handle.agent, params.sessionId)
     return { sessionId: params.sessionId, cancelled: true }
+  }
+
+  /** Sessions whose settled-idle notification already went out, until the next running transition. */
+  private readonly idleAnnounced = new Set<string>()
+  /** Per-session status generation; a later transition makes an older settled-idle stale. */
+  private readonly statusEpochs = new Map<string, number>()
+  /** One in-flight settle-and-flush per agent, shared by the notification and cancel. */
+  private readonly settledDrains = new Map<Agent, Promise<void>>()
+
+  private bumpStatusEpoch(sessionId: string): number {
+    const next = (this.statusEpochs.get(sessionId) ?? 0) + 1
+    this.statusEpochs.set(sessionId, next)
+    return next
+  }
+
+  /**
+   * The mounted memory service, read structurally: a context that publishes a
+   * different implementation under this name (a test stand-in, a stripped
+   * composition) has no settlement queue to wait for.
+   * @returns the service when it exposes {@link SettledObservations.whenSettled}.
+   */
+  private settledObservations(): SettledObservations | undefined {
+    const candidate = this.ctx.get('continuumMemory') as Partial<SettledObservations> | undefined
+    return typeof candidate?.whenSettled === 'function' ? candidate as SettledObservations : undefined
+  }
+
+  /** Whether any mounted fact source can still be inserting facts for an idle Agent. */
+  private hasSettlementSources(): boolean {
+    return this.dispatchRecorder !== undefined || this.settledObservations() !== undefined
+  }
+
+  /**
+   * Reject when `work` has not settled within this runtime's settlement bound;
+   * `settlementTimeoutMs: 0` disables the timer. The timer is unref'd so an
+   * otherwise finished process is never held open by a barrier nobody waits on.
+   * A rejection of `work` propagates as the same value.
+   * @param work - the barrier to bound.
+   * @param sessionId - session named in the timeout failure.
+   * @returns the barrier's own outcome when it settles in time.
+   */
+  private withSettlementDeadline<T>(work: Promise<T>, sessionId: string): Promise<T> {
+    const timeoutMs = this.options.settlementTimeoutMs ?? 30_000
+    if (timeoutMs <= 0) return work
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`session "${sessionId}" did not settle and flush within ${timeoutMs}ms`))
+      }, timeoutMs)
+      timer.unref?.()
+      work.then(
+        (value) => { clearTimeout(timer); resolve(value) },
+        (error: unknown) => { clearTimeout(timer); reject(error) },
+      )
+    })
+  }
+
+  /**
+   * Wait for every fact this Agent's last work produced, then make its log
+   * durable. Three facts are distinct: the loop stopped, the recorder's
+   * scheduled settlement records were inserted, and the queued memory
+   * admissions resolved. Only after all three does the Session flush. Concurrent
+   * callers (the status listener and `cancel`) share one pass, so a session's
+   * observations are never awaited twice.
+   * @param agent - the session's live agent.
+   * @returns a promise that resolves after settlement and the storage flush.
+   * @throws when the recorder, the memory service, or the flush reports failure,
+   *   or the barrier exceeds {@link HarnessSdkJsonRpcServerOptions.settlementTimeoutMs}.
+   */
+  private drainSettled(agent: Agent, sessionId: string): Promise<void> {
+    const pending = this.settledDrains.get(agent)
+    if (pending !== undefined) return pending
+    const drain = (async () => {
+      await this.withSettlementDeadline((async () => {
+        // Native dispatch settlement records are appended from a microtask
+        // after the publishing append unwinds; wait for that queue, not for a
+        // scheduler delay.
+        await this.dispatchRecorder?.whenSettled(SessionId(sessionId))
+        await this.settledObservations()?.whenSettled(agent)
+      })(), sessionId)
+      // A composition that publishes something else under this name has no
+      // live session to flush; only the store's real surface is awaited.
+      const sessions = this.ctx.get('sessions')
+      const store = typeof sessions?.get === 'function' && typeof sessions.flush === 'function'
+        ? sessions as { get(id: SessionId): Session | undefined; flush(session: Session): Promise<unknown> }
+        : undefined
+      const live = store?.get(SessionId(sessionId))
+      if (live !== undefined) await this.withSettlementDeadline(Promise.resolve(store.flush(live)), sessionId)
+    })().finally(() => {
+      // Only this pass may retire its own entry: a later turn can have
+      // installed a newer pass after a running transition.
+      if (this.settledDrains.get(agent) === drain) this.settledDrains.delete(agent)
+    })
+    this.settledDrains.set(agent, drain)
+    return drain
+  }
+
+  /**
+   * Report one session idle only after its queued facts have settled and the
+   * session log is durable. The loop itself already stopped, so the status
+   * notification still goes out when the barrier fails — suppressing it would
+   * hang a client waiting for quiescence — but the failure is logged at error
+   * level and is never reported as settled evidence: `cancel` and `shutdown`
+   * surface the same rejection to their callers.
+   * @param agent - the session's live agent.
+   * @param sessionId - the session whose idle transition this reports.
+   * @param epoch - status generation captured when the transition arrived.
+   */
+  private async announceSettledIdle(agent: Agent, sessionId: string, epoch: number): Promise<void> {
+    let settlement: SdkSessionSettlement = 'settled'
+    try {
+      await this.drainSettled(agent, sessionId)
+    } catch (error: unknown) {
+      settlement = 'failed'
+      this.ctx.logger.error(`sdk session idle settlement failed for "${sessionId}": ${String(error)}`)
+    }
+    // A later transition owns the current status; a duplicate idle is not sent twice.
+    if (this.statusEpochs.get(sessionId) !== epoch) return
+    if (this.idleAnnounced.has(sessionId)) return
+    this.idleAnnounced.add(sessionId)
+    this.transport.notify('session.status', { sessionId, status: 'idle', settlement })
   }
 
   private assertLiveAgent(rec: SessionRecord, sessionId: string): void {
@@ -430,15 +594,34 @@ export class HarnessSdkJsonRpcServer {
 
   private async performShutdown(): Promise<Record<string, never>> {
     this.shuttingDown = true
-    this.dispatchRecorderDispose?.()
-    this.dispatchRecorderDispose = undefined
     const pendingCreations = [...this.sessionCreations.values()]
     await Promise.allSettled(pendingCreations)
     this.sessionCreations.clear()
-    const records = [...this.sessions.values()]
+    const records = [...this.sessions.entries()]
+    const failures: unknown[] = []
+    // Stop each target Agent's own loop first and let it converge. The Agent's
+    // Session, the event channel and the dispatch recorder all stay mounted
+    // here: work still running at shutdown is cancelled by this step, and the
+    // facts it commits on the way out must still reach storage. Disposal later
+    // only re-runs an already-idle agent.
+    const stops = await Promise.allSettled(records.map(async ([sessionId, rec]) => {
+      const agent = rec.handle.agent
+      const runtime = agent as Partial<Pick<Agent, 'status' | 'cancel' | 'whenIdle'>>
+      if (runtime.status !== 'running' || runtime.cancel === undefined) return
+      runtime.cancel({ kind: 'disposed' })
+      if (runtime.whenIdle !== undefined) await this.withSettlementDeadline(runtime.whenIdle(), sessionId)
+    }))
+    failures.push(...rejectedReasons(stops))
+    // Now the queues are quiet: drain the recorder's scheduled settlement
+    // records and the memory admissions, then flush, still before unloading.
+    const drains = await Promise.allSettled(records.map(([sessionId, rec]) =>
+      this.drainSettled(rec.handle.agent, sessionId)))
+    failures.push(...rejectedReasons(drains))
+    this.settledDrains.clear()
+    this.dispatchRecorder?.()
+    this.dispatchRecorder = undefined
     this.sessions.clear()
     this.cancelGenerations.clear()
-    const failures: unknown[] = []
     while (this.disposers.length > 0) {
       try {
         this.disposers.pop()?.()
@@ -447,13 +630,11 @@ export class HarnessSdkJsonRpcServer {
       }
     }
     const teardownResults = await Promise.allSettled([
-      ...records.map(rec => Promise.resolve().then(() => rec.handle.dispose())),
+      ...records.map(([, rec]) => Promise.resolve().then(() => rec.handle.dispose())),
       ...(this.llmFiber === undefined ? [] : [Promise.resolve().then(() => this.llmFiber?.dispose())]),
     ])
     this.llmFiber = undefined
-    failures.push(...teardownResults
-      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
-      .map(result => result.reason as unknown))
+    failures.push(...rejectedReasons(teardownResults))
     if (failures.length === 1) throw failures[0]
     if (failures.length > 1) throw new AggregateError(failures, 'SDK server teardown failed')
     return {}
@@ -545,6 +726,13 @@ export class HarnessSdkJsonRpcServer {
   private hasAdapterFor(provider: string): boolean {
     return this.ctx.get('llm')?.listProviders().some(entry => entry.id === provider) ?? false
   }
+}
+
+/** Rejection reasons of settled results, in order; fulfilled entries contribute nothing. */
+function rejectedReasons(results: PromiseSettledResult<unknown>[]): unknown[] {
+  return results
+    .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+    .map(result => result.reason as unknown)
 }
 
 /**

@@ -178,12 +178,31 @@ export interface SessionEventNotification {
   event: SessionEvent
 }
 
+/**
+ * Outcome of the runtime's evidence barrier for one `idle` transition.
+ * `settled`: dispatch settlement records, queued memory admissions, and the
+ * Session log flush all completed before the notification. `failed`: one of
+ * them rejected or the barrier timed out, so the transition reports only that
+ * the loop stopped. The dispatch and memory facts may then be incomplete.
+ */
+export type SdkSessionSettlement = 'settled' | 'failed'
+
 /** Whole-agent lifecycle state for one session. */
 export interface SessionStatusNotification {
   /** Session whose live agent changed status. */
   sessionId: string
   /** The whole-agent state after the transition. */
   status: 'idle' | 'running'
+  /**
+   * Outcome of the evidence barrier this runtime applied to an `idle`
+   * transition. `settled` means the dispatch settlement records, the queued
+   * memory admissions and the Session log flush all completed before this
+   * notification was sent; `failed` means one of them rejected or the barrier
+   * timed out, so `idle` describes the stopped loop only. Absent when the
+   * runtime applies no barrier (the composition has no fact source still
+   * draining), and never present on `running`.
+   */
+  settlement?: SdkSessionSettlement
 }
 
 /** `subagent.started` payload: an in-runtime child session was created. */

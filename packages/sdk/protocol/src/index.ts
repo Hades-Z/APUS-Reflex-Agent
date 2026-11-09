@@ -22,6 +22,7 @@ export type {
   SdkRequestView,
   SdkRequestViewRefusal,
   SdkRunStatus,
+  SdkSessionSettlement,
   SessionCancelParams,
   SessionCancelResult,
   SessionDispatchesParams,

@@ -89,6 +89,34 @@ export interface MemoryRetrievalReport {
 export interface MemoryRetrievalOutcome {
   readonly workingSet: MemoryWorkingSet
   readonly report: MemoryRetrievalReport
+  /** Complete scoring and exclusion facts, not cut at the report's recorded-entry bound. */
+  readonly facts: MemoryRetrievalSourceFacts
+}
+
+/** One active record as scored and whether it survived the candidate and byte limits. */
+export interface MemoryRetrievalParticipant {
+  readonly record: MemoryRecord
+  readonly score: number
+  readonly matchedTerms: readonly string[]
+}
+
+/** Complete retrieval participation: every scored record, every survivor, every exclusion. */
+export interface MemoryRetrievalSourceFacts {
+  readonly candidatePool: MemoryCandidatePool
+  readonly terms: readonly string[]
+  /** Every active record that entered scoring, in ranked order. */
+  readonly participants: readonly MemoryRetrievalParticipant[]
+  /** Survivors in model order with their exact excerpt window. */
+  readonly candidates: readonly MemoryCandidate[]
+  /** Every exclusion with its real reason, in exclusion order. */
+  readonly excluded: readonly MemoryDroppedRecord[]
+  /**
+   * Active records the derived index prefilter removed before scoring. They were never evaluated, so a reader must
+   * not treat them as records the lexical match rejected.
+   */
+  readonly prefiltered: readonly MemoryRecord[]
+  /** Survivors in the order handed to the freshness filter. */
+  readonly handoff: readonly MemoryCandidate[]
 }
 
 /** One order-preserving subset and the candidates its byte budget excluded. */
@@ -188,6 +216,18 @@ export function retrieveMemoryWorkingSetWithReport(
   const workingSet = renderMemoryWorkingSet(query, candidates)
   return Object.freeze({
     workingSet,
+    facts: Object.freeze({
+      candidatePool: all ? 'all' : 'lexical',
+      terms: Object.freeze([...terms]),
+      participants: Object.freeze(ranked.map(item => Object.freeze({
+        record: item.record, score: item.score, matchedTerms: Object.freeze([...item.matchedTerms]),
+      }))),
+      candidates: Object.freeze([...candidates]),
+      excluded: Object.freeze([...dropped]),
+      prefiltered: Object.freeze(indexedIds === undefined ? [] : visible
+        .filter(({ record }) => !indexedIds.has(record.id)).map(({ record }) => record)),
+      handoff: Object.freeze([...candidates]),
+    }),
     report: Object.freeze({
       candidatePool: all ? 'all' : 'lexical',
       activeRecords: visible.length,

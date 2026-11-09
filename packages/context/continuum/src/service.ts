@@ -2,14 +2,24 @@ import { Context, Service, type Volatile } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type {} from '@deepseek-ai/dsh-compaction'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { randomUUID } from 'node:crypto'
 import { SessionSeq, type Session, type SessionEvent, type SessionId } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
-import { ContinuumMemoryController, resolveContinuumMemorySwitch, type ContinuumMemorySwitch } from './policy.ts'
 import {
-  appendMemoryIndexEvent, appendMemoryRecordEvent, appendMemoryWriteDecision, executionSourceFacts,
-  foldMemoryRecordEvents, memorySourceText, type MemoryWriteDecisionEventData,
+  ContinuumMemoryController, resolveContinuumMemorySwitch, type ContinuumMemorySwitch, type MemoryIndexObservation,
+} from './policy.ts'
+import {
+  appendMemoryIndexEvent, appendMemoryRecordEvent, appendMemoryWriteCandidatesEvent, appendMemoryWriteDecision,
+  appendMemoryWriteResultEvent, executionSourceFacts, foldMemoryRecordEvents, memorySourceText,
+  type MemoryAttemptResultFact, type MemoryCandidateResultFact, type MemoryWriteCandidateFact,
+  type MemoryRecordRefFact, type MemoryWriteCandidatesEventData, type MemoryWriteDecisionEventData,
+  type MemoryWriteExclusionFact,
+  type MemoryWriteOrigin, type MemoryWriteResultEventData, type MemoryWriteTriggerRef, type MemoryWriteWindowFact,
 } from './persistence.ts'
-import { MemoryId as createMemoryId, MemoryRecordStore, type MemoryId, type MemoryRecord, type NewMemoryRecord } from './records.ts'
+import {
+  MemoryId as createMemoryId, MemoryRecordStore,
+  type MemoryId, type MemoryRecord, type MemorySourceRef, type NewMemoryRecord,
+} from './records.ts'
 import {
   installContinuumMemoryControllerContext,
   type ContinuumAdmissionCandidate,
@@ -234,11 +244,9 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
   }
 
   create(agent: Agent, record: NewMemoryRecord): MemoryRecord {
-    const store = this.storeFor(agent)
-    const created = store.create(record)
-    appendMemoryRecordEvent(agent.session, 'create', created)
-    this.controller(agent).observe(created, agent.session)
-    return created
+    // A caller-owned transition is its own trigger: no automatic entry, and no candidate or result event to write.
+    const attempt = this.createAttempt(agent, record, { writeId: randomUUID(), origin: 'explicit', attemptId: randomUUID() })
+    return attempt.created
   }
 
   supersede(agent: Agent, id: MemoryId, expectedRevision: number, replacement: NewMemoryRecord): MemoryRecord {
@@ -268,6 +276,62 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
 
   private switchConfig(): ContinuumMemorySwitch {
     return { enabled: readSetting(this.config.enabled), mode: readSetting(this.config.mode), reflexMounted: this.ctx.get('jev') !== undefined }
+  }
+
+  /**
+   * One real create attempt: store mutation, record event, lexical index observation. Each stage keeps its own result
+   * because they are not atomic — a later failure does not undo an earlier success.
+   * @param agent - Agent whose Session receives the record and index events.
+   * @param record - proposed record fields from the source-backed caller.
+   * @param attribution - the write trigger and attempt this call belongs to.
+   * @returns the created record, the append/index evidence, and any stage failure.
+   */
+  private createAttempt(
+    agent: Agent,
+    record: NewMemoryRecord,
+    attribution: { readonly writeId: string; readonly origin: MemoryWriteOrigin; readonly attemptId: string },
+  ): MemoryCreateAttempt {
+    const store = this.storeFor(agent)
+    const created = store.create(record)
+    let recordEvent: SessionEvent<'continuum/memory-record'> | undefined
+    try {
+      recordEvent = appendMemoryRecordEvent(agent.session, 'create', created, undefined, attribution)
+    } catch (error: unknown) {
+      // The store already holds the record; returning here would hide that partial success.
+      this.ctx.logger.warn(`continuum memory record event was not recorded: ${errorMessage(error)}`)
+      return {
+        created,
+        attempt: {
+          attemptId: attribution.attemptId, proposedRecordId: String(created.id), origin: attribution.origin,
+          storeStatus: 'created', appendStatus: 'rejected', indexStatus: 'not_attempted', l1Status: 'unverifiable',
+          failure: { stage: 'append', message: errorMessage(error) },
+        },
+        indexEvents: [],
+      }
+    }
+    let observed: MemoryIndexObservation = []
+    let indexStatus: MemoryAttemptResultFact['indexStatus'] = 'observed'
+    let failure: MemoryAttemptResultFact['failure']
+    try {
+      observed = this.controller(agent).observe(created, agent.session, attribution)
+    } catch (error: unknown) {
+      // The record and its log event already exist; the derived index did not observe this snapshot.
+      indexStatus = 'unverifiable'
+      failure = { stage: 'index', message: errorMessage(error) }
+      this.ctx.logger.warn(`continuum memory index observation failed: ${errorMessage(error)}`)
+    }
+    return {
+      created,
+      attempt: {
+        attemptId: attribution.attemptId, proposedRecordId: String(created.id), origin: attribution.origin,
+        storeStatus: 'created', appendStatus: 'accepted', indexStatus, l1Status: 'unverifiable',
+        recordEventRef: { sessionId: agent.session.id, seq: recordEvent.seq },
+        ...(failure === undefined ? {} : { failure }),
+      },
+      // A cold-start `full` report describes the construction-time snapshot, not this record; it stays in the log
+      // but is not attributed to this attempt.
+      indexEvents: observed.filter(event => event.type !== 'continuum/memory-index-rebuilt' || event.data.scope !== 'full'),
+    }
   }
 
   private storeFor(agent: Agent): MemoryRecordStore {
@@ -311,34 +375,87 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
   }
 
   private async admitCandidates(agent: Agent, event: SessionEvent<'compaction/summary'>, scope: string, signal: AbortSignal): Promise<void> {
+    const session: Session = agent.session
+    const writeId = randomUUID()
+    const triggerRef: MemoryWriteTriggerRef = { sessionId: session.id, eventSeq: event.seq, eventType: 'compaction/summary' }
+    const window: MemoryWriteWindowFact = {
+      kind: 'compaction', summarySeq: event.seq, shadowedSeqs: [...event.data.shadowedSeqs],
+    }
     const shadowed = new Set<number>(event.data.shadowedSeqs)
     const projection = this.projectionFor(agent, this.switchConfig())
     const store = projection.store
     // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
-    const candidates: (ContinuumAdmissionCandidate & { readonly seq: SessionEvent['seq'] })[] = agent.session.snapshotEvents()
-      .filter(source => shadowed.has(source.seq))
-      .flatMap((source) => {
-        const content = memorySourceText(source)
-        const id = `${String(agent.session.id)}:${String(source.seq)}`
-        return content.length === 0 || store.get(createMemoryId(id)) !== undefined ? [] : [{ id, content, seq: source.seq }]
-      })
-    if (candidates.length === 0) return
-    const judged = await this.admitted(agent, candidates, signal)
+    const sourceEvents = session.snapshotEvents().filter(source => shadowed.has(source.seq))
+    const candidates: (ContinuumAdmissionCandidate & { readonly seq: SessionEvent['seq'] })[] = []
+    const exclusions: MemoryWriteExclusionFact[] = []
+    for (const source of sourceEvents) {
+      const content = memorySourceText(source)
+      const id = `${String(session.id)}:${String(source.seq)}`
+      if (content.length === 0) { exclusions.push({ sourceRefs: [sourceRefOf(session.id, source.seq)], reason: 'not-human-text' }); continue }
+      if (store.get(createMemoryId(id)) !== undefined) {
+        exclusions.push({ sourceRefs: [sourceRefOf(session.id, source.seq)], reason: 'existing-record' }); continue
+      }
+      candidates.push({ id, content, seq: source.seq })
+    }
+    const offered: MemoryWriteCandidateFact[] = candidates.map(candidate => ({
+      candidateId: candidate.id,
+      sourceRefs: [sourceRefOf(session.id, candidate.seq)],
+      normalization: { textBlocksOnly: true, joinSeparator: '\n', trim: true, sourceChars: candidate.content.length, candidateChars: candidate.content.length, truncated: false },
+      targetRecordId: candidate.id,
+    }))
+    appendMemoryWriteCandidatesEvent(session, {
+      version: 1, writeId, origin: 'compaction',
+      status: candidates.length === 0 ? 'skipped' : 'candidates_ready',
+      ...(candidates.length === 0 ? { reason: 'no-candidates' } : {}),
+      triggerRef, window, candidates: offered, exclusions,
+      coverage: { sourceWindowComplete: true, candidateListComplete: true, missingEvidence: [] },
+    }, warn(this.ctx))
+    if (candidates.length === 0) {
+      // The exclusions live on the candidates event; this result states that no attempt followed them.
+      appendMemoryWriteResultEvent(session, writeResultOf(writeId, 'compaction', triggerRef, offered, [], [], [], [], []), warn(this.ctx))
+      return
+    }
+    const judged = await this.admitted(agent, candidates, signal, writeId)
     const admitted = new Map(judged.admitted.map(memory => [memory.id, memory.tags]))
-    if (!this.state().enabled) return
+    if (!this.state().enabled) {
+      appendMemoryWriteResultEvent(session, writeResultOf(writeId, 'compaction', triggerRef, offered, [], [], [], [], ['consumer disabled before any record was written']), warn(this.ctx))
+      return
+    }
+    const candidateResults: MemoryCandidateResultFact[] = []
+    const attemptResults: MemoryAttemptResultFact[] = []
+    const recordEventRefs: { sessionId: SessionId; seq: SessionSeq }[] = []
+    const indexEventRefs: { sessionId: SessionId; seq: SessionSeq; kind: 'l1' | 'lexical' }[] = []
     for (const candidate of candidates) {
       const id = createMemoryId(candidate.id)
       const tags = admitted.get(candidate.id)
-      if (tags === undefined || store.get(id) !== undefined) continue
-      const source = { sessionId: agent.session.id, eventSeq: candidate.seq }
-      // The record event carries the record's content; the index event states
-      // where it became findable. The record goes first, so a fold recovers the
-      // record even when the index event was never written.
-      this.create(agent, { id, kind: 'fact', scope, content: candidate.content, sourceRefs: [source] })
-      appendMemoryIndexEvent(agent.session, { id, scope, tags: [...tags], source },
-        { source: 'compaction', tagSource: judged.tagSource })
-      projection.tags.set(id, tags)
+      if (tags === undefined) { candidateResults.push({ candidateId: candidate.id, status: 'rejected', reason: 'not-admitted' }); continue }
+      if (store.get(id) !== undefined) { candidateResults.push({ candidateId: candidate.id, status: 'already_exists', reason: 'existing-record' }); continue }
+      const source = { sessionId: session.id, eventSeq: candidate.seq }
+      const attemptId = randomUUID()
+      const attempt = this.createAttempt(agent, { id, kind: 'fact', scope, content: candidate.content, sourceRefs: [source] }, { writeId, origin: 'compaction', attemptId })
+      attemptResults.push({ ...attempt.attempt, candidateId: candidate.id })
+      recordEventRefs.push(...(attempt.attempt.recordEventRef === undefined ? [] : [attempt.attempt.recordEventRef]))
+      indexEventRefs.push(...attempt.indexEvents.map(event => indexRef(agent.session.id, event)))
+      if (attempt.attempt.appendStatus !== 'accepted') {
+        candidateResults.push({ candidateId: candidate.id, status: 'failed', reason: 'record-append-rejected', record: recordRefOf(attempt.created), attemptId })
+        continue
+      }
+      try {
+        const indexEvent = appendMemoryIndexEvent(session, { id, scope, tags: [...tags], source },
+          { source: 'compaction', tagSource: judged.tagSource }, { writeId, origin: 'compaction', attemptId })
+        indexEventRefs.push({ sessionId: session.id, seq: indexEvent.seq, kind: 'l1' })
+        projection.tags.set(id, tags)
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`continuum L1 index entry was not written: ${String(error)}`)
+        candidateResults.push({ candidateId: candidate.id, status: 'record_accepted', reason: 'l1-index-rejected', record: recordRefOf(attempt.created), attemptId })
+        continue
+      }
+      candidateResults.push({ candidateId: candidate.id, status: 'record_accepted', record: recordRefOf(attempt.created), attemptId })
     }
+    appendMemoryWriteResultEvent(session, writeResultOf(
+      writeId, 'compaction', triggerRef, offered, candidateResults, attemptResults, recordEventRefs, indexEventRefs,
+      attemptResults.flatMap(failure => failure.failure === undefined ? [] : [`${failure.proposedRecordId}: ${failure.failure.stage}`]),
+    ), warn(this.ctx))
   }
 
   /**
@@ -393,22 +510,79 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
     scope: string | undefined,
     signal: AbortSignal,
   ): Promise<void> {
-    const session = agent.session
-    const decide = (decision: MemoryWriteDecisionEventData): void => {
+    const session: Session = agent.session
+    const writeId = randomUUID()
+    const triggerRef: MemoryWriteTriggerRef = { sessionId: session.id, eventSeq: SessionSeq(stepEndSeq), eventType: 'step/end' }
+    const window: MemoryWriteWindowFact = { kind: 'execution', stepStartSeq: SessionSeq(opened.seq), stepEndSeq: SessionSeq(stepEndSeq) }
+    const candidatesEvent = (
+      status: MemoryWriteCandidatesEventData['status'],
+      reason: string | undefined,
+      candidateFacts: readonly MemoryWriteCandidateFact[],
+      exclusions: readonly MemoryWriteExclusionFact[],
+    ): void => {
       // A disposed Agent's Session may already be detached; appending then would fork the log.
       if (this.disposedAgents.has(agent) || !this.agentsBySession.has(session.id)) return
-      appendMemoryWriteDecision(session, decision, (message) => { this.ctx.logger.warn(message) })
+      appendMemoryWriteCandidatesEvent(session, {
+        version: 1, writeId, origin: 'execution', status,
+        ...(reason === undefined ? {} : { reason }),
+        triggerRef, window, candidates: candidateFacts, exclusions,
+        coverage: { sourceWindowComplete: true, candidateListComplete: true, missingEvidence: [] },
+      }, warn(this.ctx))
+    }
+    const finish = (
+      decision: MemoryWriteDecisionEventData,
+      result: Omit<MemoryWriteResultEventData, 'version' | 'writeId' | 'origin' | 'triggerRef' | 'nativeWriteDecisionRef' | 'reportedCounts'>,
+    ): void => {
+      if (this.disposedAgents.has(agent) || !this.agentsBySession.has(session.id)) return
+      const decisionEvent = appendMemoryWriteDecision(session, decision, warn(this.ctx))
+      appendMemoryWriteResultEvent(session, {
+        version: 1, writeId, origin: 'execution', triggerRef, ...result,
+        ...(decisionEvent === undefined ? {} : { nativeWriteDecisionRef: { sessionId: session.id, seq: decisionEvent.seq } }),
+        reportedCounts: {
+          candidateRecords: decision.candidateRecords,
+          ...(decision.writtenRecords === undefined ? {} : { writtenRecords: decision.writtenRecords }),
+        },
+      }, warn(this.ctx))
+    }
+    const empty = {
+      candidateResults: [], attemptResults: [], recordEventRefs: [], indexEventRefs: [],
+      partialFailures: [], missingEvidence: [],
     }
     if (signal.aborted || opened.signal.aborted) {
-      decide({ turn: opened.turn, step: opened.step, outcome: 'failed', reason: 'cancelled', candidateRecords: 0 })
+      candidatesEvent('skipped', 'cancelled', [], [])
+      finish({ turn: opened.turn, step: opened.step, outcome: 'failed', reason: 'cancelled', candidateRecords: 0 }, empty)
       return
     }
-    if (scope === undefined) { decide({ turn: opened.turn, step: opened.step, outcome: 'skipped', reason: 'no-scope', candidateRecords: 0 }); return }
+    if (scope === undefined) {
+      candidatesEvent('skipped', 'no-scope', [], [])
+      finish({ turn: opened.turn, step: opened.step, outcome: 'skipped', reason: 'no-scope', candidateRecords: 0 }, empty)
+      return
+    }
     const admitter = this.ctx.get('continuumMemoryAdmitter')
-    if (admitter?.judgeExecution === undefined) { decide({ turn: opened.turn, step: opened.step, outcome: 'skipped', reason: 'no-admitter', candidateRecords: 0 }); return }
+    if (admitter?.judgeExecution === undefined) {
+      candidatesEvent('skipped', 'no-admitter', [], [])
+      finish({ turn: opened.turn, step: opened.step, outcome: 'skipped', reason: 'no-admitter', candidateRecords: 0 }, empty)
+      return
+    }
     // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
     const candidates = executionSourceFacts(session.snapshotEvents(), opened.seq, stepEndSeq)
-    if (candidates.length === 0) { decide({ turn: opened.turn, step: opened.step, outcome: 'skipped', reason: 'no-new-facts', candidateRecords: 0 }); return }
+    const offered: MemoryWriteCandidateFact[] = candidates.map(candidate => ({
+      candidateId: candidate.id,
+      sourceRefs: [sourceRefOf(session.id, SessionSeq(candidate.seq))],
+      normalization: {
+        textBlocksOnly: true, joinSeparator: '\n', trim: true,
+        // `executionSourceFacts` keeps only a prefix of the event text; the source event remains the complete text.
+        sourceChars: sourceTextLength(session, candidate.seq) ?? candidate.content.length,
+        candidateChars: candidate.content.length,
+        truncated: (sourceTextLength(session, candidate.seq) ?? candidate.content.length) > candidate.content.length,
+      },
+    }))
+    if (candidates.length === 0) {
+      candidatesEvent('skipped', 'no-candidates', [], [])
+      finish({ turn: opened.turn, step: opened.step, outcome: 'skipped', reason: 'no-new-facts', candidateRecords: 0 }, empty)
+      return
+    }
+    candidatesEvent('candidates_ready', undefined, offered, [])
     // The projection's generation invalidates a proposal judged across a disable and re-enable.
     const projection = this.projectionFor(agent, this.switchConfig())
     const ticket = projection.controller.beginRead({ scopes: [scope] })
@@ -416,43 +590,83 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
       !signal.aborted && !opened.signal.aborted && ticket !== undefined && projection.controller.isCurrent(ticket)
     let kept: readonly ContinuumAdmittedMemory[]
     try {
-      kept = await admitter.judgeExecution(agent, { candidates, isCurrent }, signal)
+      kept = await admitter.judgeExecution(agent, {
+        candidates, isCurrent, writeId,
+      }, signal)
     } catch (error: unknown) {
       if (isCurrent()) {
         this.ctx.logger.warn(`continuum execution judge failed: ${String(error)}`)
-        decide({ turn: opened.turn, step: opened.step, outcome: 'failed', reason: 'error', candidateRecords: candidates.length })
+        finish(
+          { turn: opened.turn, step: opened.step, outcome: 'failed', reason: 'error', candidateRecords: candidates.length },
+          { ...empty, candidateResults: offered.map(entry => ({ candidateId: entry.candidateId, status: 'failed', reason: 'judge-error' })), partialFailures: ['judge-error'] },
+        )
       } else {
-        decide({ turn: opened.turn, step: opened.step, outcome: 'failed', reason: 'cancelled', candidateRecords: candidates.length })
+        finish(
+          { turn: opened.turn, step: opened.step, outcome: 'failed', reason: 'cancelled', candidateRecords: candidates.length },
+          { ...empty, candidateResults: offered.map(entry => ({ candidateId: entry.candidateId, status: 'cancelled' })) },
+        )
       }
       return
     }
     if (!isCurrent()) {
-      decide({ turn: opened.turn, step: opened.step, outcome: 'skipped', reason: 'stale', candidateRecords: candidates.length })
+      finish(
+        { turn: opened.turn, step: opened.step, outcome: 'skipped', reason: 'stale', candidateRecords: candidates.length },
+        { ...empty, candidateResults: offered.map(entry => ({ candidateId: entry.candidateId, status: 'cancelled', reason: 'stale' })) },
+      )
       return
     }
-    const byId = new Map(candidates.map(candidate => [candidate.id, candidate]))
-    let written = 0
-    for (const memory of kept) {
-      const candidate = byId.get(memory.id)
-      if (candidate === undefined) continue
+    const keptIds = new Set(kept.map(memory => memory.id))
+    const candidateResults: MemoryCandidateResultFact[] = []
+    const attemptResults: MemoryAttemptResultFact[] = []
+    const recordEventRefs: { sessionId: SessionId; seq: SessionSeq }[] = []
+    const indexEventRefs: { sessionId: SessionId; seq: SessionSeq; kind: 'l1' | 'lexical' }[] = []
+    for (const candidate of candidates) {
+      if (!keptIds.has(candidate.id)) {
+        candidateResults.push({ candidateId: candidate.id, status: 'rejected', reason: 'judge-rejected' })
+        continue
+      }
       const id = createMemoryId(`${String(session.id)}:execution:${String(stepEndSeq)}:${candidate.id}`)
-      if (projection.store.get(id) !== undefined) continue
+      if (projection.store.get(id) !== undefined) {
+        candidateResults.push({ candidateId: candidate.id, status: 'already_exists', reason: 'existing-record' })
+        continue
+      }
+      const attemptId = randomUUID()
+      let attempt: MemoryCreateAttempt
       try {
-        this.create(agent, {
+        attempt = this.createAttempt(agent, {
           id, kind: 'fact', scope,
           content: candidate.content,
           // The source is the message that carries the text, so history readback resolves it.
           sourceRefs: [{ sessionId: session.id, eventSeq: SessionSeq(candidate.seq) }],
-        })
+        }, { writeId, origin: 'execution', attemptId })
       } catch (error: unknown) {
         this.ctx.logger.warn(`continuum execution record was not written: ${String(error)}`)
+        candidateResults.push({ candidateId: candidate.id, status: 'failed', reason: 'store-rejected', attemptId })
+        attemptResults.push({
+          attemptId, proposedRecordId: String(id), candidateId: candidate.id, origin: 'execution',
+          storeStatus: 'rejected', appendStatus: 'unverifiable', indexStatus: 'not_attempted', l1Status: 'not_applicable',
+          failure: { stage: 'store', message: errorMessage(error) },
+        })
         continue
       }
-      written += 1
+      attemptResults.push({ ...attempt.attempt, candidateId: candidate.id })
+      recordEventRefs.push(...(attempt.attempt.recordEventRef === undefined ? [] : [attempt.attempt.recordEventRef]))
+      indexEventRefs.push(...attempt.indexEvents.map(event => indexRef(session.id, event)))
+      candidateResults.push(attempt.attempt.appendStatus === 'accepted'
+        ? { candidateId: candidate.id, status: 'record_accepted', record: recordRefOf(attempt.created), attemptId }
+        : { candidateId: candidate.id, status: 'failed', reason: 'record-append-rejected', record: recordRefOf(attempt.created), attemptId })
     }
-    decide(written === 0
+    const written = candidateResults.filter(entry => entry.status === 'record_accepted').length
+    finish(written === 0
       ? { turn: opened.turn, step: opened.step, outcome: 'skipped', reason: 'no-new-facts', candidateRecords: candidates.length }
-      : { turn: opened.turn, step: opened.step, outcome: 'admitted', reason: 'admitted', candidateRecords: candidates.length, writtenRecords: written })
+      : {
+        turn: opened.turn, step: opened.step, outcome: 'admitted', reason: 'admitted',
+        candidateRecords: candidates.length, writtenRecords: written,
+      }, {
+      candidateResults, attemptResults, recordEventRefs, indexEventRefs,
+      partialFailures: attemptResults.flatMap(attempt => attempt.failure === undefined ? [] : [`${attempt.proposedRecordId}: ${attempt.failure.stage}`]),
+      missingEvidence: [],
+    })
   }
 
   /** Compaction admission needs a mounted Reflex admitter; the other modes do not depend on it. */
@@ -462,7 +676,7 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
 
   /** Candidates the mounted admitter keeps, with tags; every candidate untagged when it fails, none when it was removed. */
   private async admitted(
-    agent: Agent, candidates: readonly ContinuumAdmissionCandidate[], signal: AbortSignal,
+    agent: Agent, candidates: readonly ContinuumAdmissionCandidate[], signal: AbortSignal, writeId?: string,
   ): Promise<{ readonly admitted: readonly ContinuumAdmittedMemory[]; readonly tagSource: 'reflex' | 'fallback-untagged' | 'unjudged' }> {
     const all = candidates.map(candidate => ({ id: candidate.id, tags: [] }))
     const admitter = this.ctx.get('continuumMemoryAdmitter')
@@ -471,6 +685,7 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
       const admission = await admitter.admit(agent, {
         candidates: candidates.map(({ id, content }) => ({ id, content })),
         isCurrent: () => !signal.aborted && this.state().enabled,
+        ...(writeId === undefined ? {} : { writeId }),
       }, signal)
       return { admitted: admission.admitted, tagSource: 'reflex' }
     } catch (error: unknown) {
@@ -488,29 +703,152 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
     if ((this.config.admission ?? 'explicit') !== 'user-message' || !this.state().enabled || event.type !== 'user/message') return
     const content = memorySourceText(event)
     const scope = this.config.scopes[0]
-    if (content.length === 0 || scope === undefined) return
+    const writeId = randomUUID()
+    const triggerRef: MemoryWriteTriggerRef = { sessionId: session.id, eventSeq: event.seq, eventType: event.type }
+    const sourceRefs: [MemorySourceRef, ...MemorySourceRef[]] = [sourceRefOf(session.id, event.seq)]
+    if (content.length === 0 || scope === undefined) {
+      appendMemoryWriteCandidatesEvent(session, {
+        version: 1, writeId, origin: 'user-message', status: 'skipped',
+        reason: scope === undefined ? 'no-scope' : 'empty-text', triggerRef,
+        window: { kind: 'user-message', messageSeq: event.seq },
+        candidates: [], exclusions: [{ sourceRefs, reason: scope === undefined ? 'not-human-text' : 'empty-text' }],
+        coverage: { sourceWindowComplete: true, candidateListComplete: true, missingEvidence: [] },
+      }, warn(this.ctx))
+      return
+    }
     const agent = this.agentsBySession.get(session.id) ?? this.ctx.get('agents')?.currentInitiator()
-    if (agent === undefined || agent.session.id !== session.id) return
+    if (agent === undefined || agent.session.id !== session.id) {
+      appendMemoryWriteCandidatesEvent(session, {
+        version: 1, writeId, origin: 'user-message', status: 'skipped', reason: 'no-agent', triggerRef,
+        window: { kind: 'user-message', messageSeq: event.seq }, candidates: [],
+        exclusions: [{ sourceRefs, reason: 'out-of-window' }],
+        coverage: { sourceWindowComplete: true, candidateListComplete: true, missingEvidence: [] },
+      }, warn(this.ctx))
+      return
+    }
     const id = createMemoryId(`${String(session.id)}:${String(event.seq)}`)
     const store = this.storeFor(agent)
-    if (store.get(id) !== undefined) return
-    this.create(agent, {
-      id,
-      kind: 'fact',
-      scope,
-      content,
-      sourceRefs: [{ sessionId: session.id, eventSeq: event.seq }],
-    })
-    // The record says the content was stored; the index says it became
-    // findable. `user-message` admission runs no tag judgement, so the entry is
-    // written untagged rather than borrowing the compaction path's tags.
-    appendMemoryIndexEvent(session, {
-      id,
-      scope,
-      tags: [],
-      source: { sessionId: session.id, eventSeq: event.seq },
-    }, { source: 'user-message', tagSource: 'unjudged' })
+    const candidateText = event.data.content
+      .filter((block): block is { readonly type: 'text'; readonly text: string } => block.type === 'text')
+      .map(block => block.text).join('\n')
+    const offered: MemoryWriteCandidateFact[] = [{
+      candidateId: String(id), sourceRefs,
+      normalization: {
+        textBlocksOnly: true, joinSeparator: '\n', trim: true,
+        sourceChars: candidateText.length, candidateChars: content.length, truncated: false,
+      },
+      targetRecordId: String(id),
+    }]
+    if (store.get(id) !== undefined) {
+      appendMemoryWriteCandidatesEvent(session, {
+        version: 1, writeId, origin: 'user-message', status: 'skipped', reason: 'existing-record', triggerRef,
+        window: { kind: 'user-message', messageSeq: event.seq }, candidates: [],
+        exclusions: [{ sourceRefs, reason: 'existing-record' }],
+        coverage: { sourceWindowComplete: true, candidateListComplete: true, missingEvidence: [] },
+      }, warn(this.ctx))
+      appendMemoryWriteResultEvent(session, writeResultOf(writeId, 'user-message', triggerRef, [], [], [], [], [], []), warn(this.ctx))
+      return
+    }
+    appendMemoryWriteCandidatesEvent(session, {
+      version: 1, writeId, origin: 'user-message', status: 'candidates_ready', triggerRef,
+      window: { kind: 'user-message', messageSeq: event.seq }, candidates: offered, exclusions: [],
+      coverage: { sourceWindowComplete: true, candidateListComplete: true, missingEvidence: [] },
+    }, warn(this.ctx))
+    const attemptId = randomUUID()
+    const attempt = this.createAttempt(agent, {
+      id, kind: 'fact', scope, content, sourceRefs,
+    }, { writeId, origin: 'user-message', attemptId })
+    const indexEventRefs: { sessionId: SessionId; seq: SessionSeq; kind: 'l1' | 'lexical' }[] =
+      attempt.indexEvents.map(indexed => ({ sessionId: session.id, seq: indexed.seq, kind: 'lexical' as const }))
+    let result: MemoryCandidateResultFact
+    if (attempt.attempt.appendStatus !== 'accepted') {
+      result = { candidateId: String(id), status: 'failed', reason: 'record-append-rejected', record: recordRefOf(attempt.created), attemptId }
+    } else {
+      // The record says the content was stored; the index says it became findable. `user-message` admission runs no
+      // tag judgement, so the entry is written untagged rather than borrowing the compaction path's tags.
+      try {
+        const indexEvent = appendMemoryIndexEvent(session, {
+          id, scope, tags: [], source: { sessionId: session.id, eventSeq: event.seq },
+        }, { source: 'user-message', tagSource: 'unjudged' }, { writeId, origin: 'user-message', attemptId })
+        indexEventRefs.push({ sessionId: session.id, seq: indexEvent.seq, kind: 'l1' })
+        result = { candidateId: String(id), status: 'record_accepted', record: recordRefOf(attempt.created), attemptId }
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`continuum L1 index entry was not written: ${String(error)}`)
+        result = { candidateId: String(id), status: 'record_accepted', reason: 'l1-index-rejected', record: recordRefOf(attempt.created), attemptId }
+      }
+    }
+    appendMemoryWriteResultEvent(session, writeResultOf(
+      writeId, 'user-message', triggerRef, offered, [result], [{ ...attempt.attempt, candidateId: String(id) }],
+      attempt.attempt.recordEventRef === undefined ? [] : [attempt.attempt.recordEventRef], indexEventRefs,
+      attempt.attempt.failure === undefined ? [] : [`${String(id)}: ${attempt.attempt.failure.stage}`],
+    ), warn(this.ctx))
   }
+}
+
+/** One create attempt's completed boundary, with the index events it appended. */
+interface MemoryCreateAttempt {
+  readonly created: MemoryRecord
+  readonly attempt: MemoryAttemptResultFact
+  readonly indexEvents: MemoryIndexObservation
+}
+
+/** Message text of an error without assuming its concrete class. */
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** Source reference for one Session event. */
+function sourceRefOf(sessionId: SessionId, seq: SessionSeq): MemorySourceRef {
+  return { sessionId, eventSeq: seq }
+}
+
+/** Record identity without an event reference; callers add the reference when they resolved it. */
+function recordRefOf(record: MemoryRecord): MemoryRecordRefFact {
+  return { recordId: String(record.id), revision: record.revision }
+}
+
+/** Index event reference plus its kind, so L1 and lexical events stay distinguishable. */
+function indexRef(sessionId: SessionId, event: SessionEvent<'continuum/memory-index-rebuilt' | 'continuum/memory-index-queued'>): { sessionId: SessionId; seq: SessionSeq; kind: 'lexical' } {
+  return { sessionId, seq: event.seq, kind: 'lexical' }
+}
+
+/** Warning sink from the service context. */
+function warn(ctx: Context): (message: string) => void {
+  return (message) => { ctx.logger.warn(message) }
+}
+
+/** One write result built from the candidate and attempt evidence collected so far. */
+function writeResultOf(
+  writeId: string,
+  origin: MemoryWriteOrigin,
+  triggerRef: MemoryWriteTriggerRef,
+  offered: readonly MemoryWriteCandidateFact[],
+  candidateResults: readonly MemoryCandidateResultFact[],
+  attemptResults: readonly MemoryAttemptResultFact[],
+  recordEventRefs: MemoryWriteResultEventData['recordEventRefs'],
+  indexEventRefs: MemoryWriteResultEventData['indexEventRefs'],
+  partialFailures: readonly string[],
+): MemoryWriteResultEventData {
+  const reported = candidateResults.map(result => result.candidateId)
+  return {
+    version: 1, writeId, origin, triggerRef,
+    candidateResults, attemptResults, recordEventRefs, indexEventRefs,
+    partialFailures,
+    missingEvidence: offered.map(candidate => candidate.candidateId).filter(id => !reported.includes(id)),
+  }
+}
+
+/** Complete text length of the event that carries one execution candidate, or undefined when absent. */
+function sourceTextLength(session: Session, seq: number): number | undefined {
+  // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
+  const event = session.snapshotEvents().find(candidate => Number(candidate.seq) === seq)
+  if (event === undefined) return undefined
+  const content = event.type === 'assistant/message'
+    ? event.data.message.content
+    : event.type === 'tool/result' ? event.data.message.content : []
+  return content
+    .filter((block): block is { readonly type: 'text'; readonly text: string } => block.type === 'text')
+    .map(block => block.text).join('\n').trim().length
 }
 
 function readSetting<T extends boolean | 'off' | 'shadow' | 'active'>(value: T | Volatile<T>): T {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from typing import Any
@@ -40,6 +41,13 @@ class _FakeHarness:
         # An exception the run raises instead of returning, which is how a
         # cancelled run surfaces: the harness aborts the turn.
         self.fail_with: BaseException | None = None
+        # The SDK client the service reaches for request views.
+        self.client: Any = None
+        # The terminal reason of a normal harness return: a completed turn,
+        # an output-token ceiling, or an error are different business states.
+        self.finish_reason: str | None = "completed"
+        # The root-session events the run returns; a failed turn keeps them.
+        self.events: list[dict[str, Any]] = []
 
     def start(self) -> None:
         self.started += 1
@@ -72,11 +80,15 @@ class _FakeHarness:
                 on_notification(notification)
         return _FakeResult(
             final_response="done",
-            finish_reason="completed",
+            finish_reason=self.finish_reason,
             session_id=session_id or "",
-            events=[],
+            events=list(self.events),
             notifications=notifications,
         )
+
+    def request_view(self, session_id: str, dispatch_seq: int) -> dict[str, Any]:
+        # Mirrors DeepSeekHarness.request_view: one relay to the SDK client.
+        return self.client.session_request_view(session_id, dispatch_seq)
 
     def cancel_session(self, session_id: str) -> None:
         self.cancelled.append(session_id)
@@ -1027,8 +1039,11 @@ def test_outbox_survives_service_restart_without_rerunning_the_task(tmp_path, mo
     recovered = HarnessService(config, harness_factory=refuse_execution, event_callback=_Events())
     try:
         _wait_for(lambda: any(p["final"] for p in delivered), "recovered final delivery")
+        _wait_for(
+            lambda: recovered.run_state(run_id)["delivery_state"]["pending_events"] == 0,
+            "the recovered outbox to drain",
+        )
         assert recovered.run_state(run_id)["status"] == "completed"
-        assert recovered.run_state(run_id)["delivery_state"]["pending_events"] == 0
         assert len(harness.prompts) == 1
     finally:
         recovered.close()
@@ -1285,5 +1300,1114 @@ def test_child_events_keep_the_parent_from_the_native_lifecycle_notice() -> None
         child = next(e for e in events if e["source_session_id"] == "child-native")
         assert child["parent_session_id"] == "root-native"
         assert child["root_session_id"] == "root-native"
+    finally:
+        service.close()
+
+
+class _ViewClient:
+    """Stands in for the SDK client's request-view call, on whatever thread asks."""
+
+    def __init__(self, view: dict[str, Any], *, fail_times: int = 0) -> None:
+        self.view = view
+        self.fail_times = fail_times
+        self.calls: list[tuple[str, int]] = []
+        self.threads: list[str] = []
+
+    def session_request_view(self, session_id: str, dispatch_seq: int) -> dict[str, Any]:
+        self.calls.append((session_id, dispatch_seq))
+        self.threads.append(threading.current_thread().name)
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError("view unavailable")
+        return {**self.view, "sessionId": session_id, "dispatchSeq": dispatch_seq}
+
+
+_NATIVE_VIEW: dict[str, Any] = {
+    "sessionId": "root-native",
+    "dispatchSeq": 9,
+    "prefixEnd": 8,
+    "turn": 1,
+    "step": 1,
+    "header": {"config": {"provider": "p", "model": "m"}},
+    "messages": [
+        {
+            "role": "user",
+            "id": "u1",
+            "source": {"kind": "user"},
+            "content": [{"type": "text", "text": "hello view"}],
+        }
+    ],
+    "toolHistory": {"tools": [], "updates": []},
+    "projectionTypes": [],
+}
+
+
+def _dispatch_notifications() -> list[Notification]:
+    return [
+        Notification(method="session.event", payload={"sessionId": "root-native", "event": {
+            "type": "llm/dispatch", "seq": 9, "time": 1,
+            "data": {"sessionId": "root-native", "prefixEnd": 8, "turn": 1, "step": 1},
+        }}),
+        Notification(method="session.event", payload={"sessionId": "root-native", "event": {
+            "type": "assistant/message", "seq": 10, "time": 2, "data": {"turn": 1, "step": 1},
+        }}),
+        Notification(method="session.event", payload={"sessionId": "root-native", "event": {
+            "type": "llm/dispatch-settled", "seq": 11, "time": 3,
+            "data": {"sessionId": "root-native", "dispatchSeq": 9, "settlementSeq": 10},
+        }}),
+        Notification(method="session.event", payload={"sessionId": "root-native", "event": {
+            "type": "step/start", "seq": 12, "time": 4, "data": {"turn": 1, "step": 1},
+        }}),
+    ]
+
+
+def _collecting_service(harness: _FakeHarness, events: list[dict[str, Any]]) -> HarnessService:
+    class _Events:
+        def post(self, url: str, payload: dict[str, Any], timeout: float) -> None:
+            events.append(payload)
+
+    return HarnessService(
+        DeepSeekHarnessConfig(), harness_factory=lambda _config: harness, event_callback=_Events(),
+    )
+
+
+def test_dispatch_events_carry_the_native_view_fetched_on_the_sender_thread() -> None:
+    """The sidecar view is the runtime's own object, for dispatch events only.
+
+    A view fetched from the notification receiver would deadlock the runtime
+    that is still delivering; the sender thread is the one place the request
+    may run. The settled record names its dispatch, so its view is that
+    dispatch's, not a view of the settlement record's own seq.
+    """
+    harness = _FakeHarness()
+    harness.client = _ViewClient(_NATIVE_VIEW)
+    harness.notifications = _dispatch_notifications()
+    harness.gate.set()
+    events: list[dict[str, Any]] = []
+    service = _collecting_service(harness, events)
+    try:
+        service.start_run({
+            "instruction": "do it", "session_id": "root-native",
+            "event_url": "http://events.invalid/v1/events",
+        })
+        _wait_for(lambda: len(events) >= 4, "the four source events")
+        by_type = {e["event"]["type"]: e for e in events if not e.get("final")}
+        dispatch = by_type["llm/dispatch"]
+        settled = by_type["llm/dispatch-settled"]
+        assert dispatch["event"]["seq"] == 9
+        assert dispatch["event"] == _dispatch_notifications()[0].payload["event"]
+        assert dispatch["request_view"]["messages"][0]["content"][0]["text"] == "hello view"
+        assert dispatch["request_view"]["prefixEnd"] == 8
+        assert settled["request_view"]["dispatchSeq"] == 9
+        assert settled["request_view"] == dispatch["request_view"]
+        assert "request_view" not in by_type["step/start"]
+        # One view per dispatch: the settled record reuses it instead of asking again.
+        assert harness.client.calls == [("root-native", 9)]
+        assert all(name.startswith("events-") for name in harness.client.threads)
+    finally:
+        service.close()
+
+
+def test_a_dispatch_event_without_a_view_is_reported_unchanged_with_the_gap_named() -> None:
+    harness = _FakeHarness()
+    harness.client = _ViewClient(_NATIVE_VIEW, fail_times=99)
+    harness.notifications = _dispatch_notifications()[:1]
+    harness.gate.set()
+    events: list[dict[str, Any]] = []
+    service = _collecting_service(harness, events)
+    try:
+        run_id = service.start_run({
+            "instruction": "do it", "session_id": "root-native",
+            "event_url": "http://events.invalid/v1/events",
+        })
+        _wait_for(lambda: any(e["event"]["type"] == "llm/dispatch" for e in events), "the source event")
+        report = next(e for e in events if e["event"]["type"] == "llm/dispatch")
+        assert "request_view" not in report
+        assert report["event"] == _dispatch_notifications()[0].payload["event"]
+        assert "request_view" in service.run_state(run_id)["delivery_state"]["error"]
+        service.close()
+        assert harness.client.calls == [("root-native", 9)]
+    finally:
+        service.close()
+
+
+def test_a_redelivered_dispatch_report_repeats_the_same_content(monkeypatch) -> None:
+    """A retry must not turn a view-less first send into a different second one."""
+    monkeypatch.setenv("DSH_DELIVERY_MAX_ATTEMPTS", "1")
+    monkeypatch.setenv("DSH_DELIVERY_RETRY_DELAY_SEC", "0.001")
+    harness = _FakeHarness()
+    harness.client = _ViewClient(_NATIVE_VIEW, fail_times=1)
+    harness.notifications = _dispatch_notifications()[:1]
+    harness.gate.set()
+    posted: list[dict[str, Any]] = []
+
+    class _Flaky:
+        def post(self, url: str, payload: dict[str, Any], timeout: float) -> None:
+            posted.append(payload)
+            if len(posted) == 1:
+                raise OSError("lost event request")
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(), harness_factory=lambda _config: harness, event_callback=_Flaky(),
+    )
+    try:
+        service.start_run({
+            "instruction": "do it", "session_id": "root-native",
+            "event_url": "http://events.invalid/v1/events",
+        })
+        _wait_for(lambda: len(posted) >= 2, "the retried report")
+        assert posted[0] == posted[1]
+        assert "request_view" not in posted[0]
+        # One decision per dispatch, reused by the retry instead of asking again.
+        assert harness.client.calls == [("root-native", 9)]
+    finally:
+        service.close()
+
+
+def test_the_report_carries_the_runtime_view_unchanged() -> None:
+    """The sidecar is the runtime's own object: no field added, none dropped.
+
+    A view fetched while its dispatch ran has no settlement yet. That gap is
+    the runtime's answer, so this service must neither invent a settlement nor
+    flatten the object to the fields it happens to use.
+    """
+    runtime_view = {
+        **_NATIVE_VIEW,
+        "turn": 3,
+        "step": 2,
+        "header": {"config": {"provider": "p", "model": "m"}, "tools": [{"name": "read"}]},
+        "tools": [{"name": "read"}],
+        "projectionTypes": ["image/offload"],
+    }
+    harness = _FakeHarness()
+    harness.client = _ViewClient(runtime_view)
+    harness.notifications = _dispatch_notifications()
+    harness.gate.set()
+    events: list[dict[str, Any]] = []
+    service = _collecting_service(harness, events)
+    try:
+        service.start_run({
+            "instruction": "do it", "session_id": "root-native",
+            "event_url": "http://events.invalid/v1/events",
+        })
+        _wait_for(lambda: len(events) >= 4, "the four source events")
+        dispatch = next(e for e in events if e["event"]["type"] == "llm/dispatch")
+        assert dispatch["request_view"] == runtime_view
+        assert "settlementSeq" not in dispatch["request_view"]
+    finally:
+        service.close()
+
+
+def test_a_recovered_report_repeats_the_view_it_was_queued_with(tmp_path, monkeypatch) -> None:
+    """An outbox entry keeps what its first attempt carried, not a refetch.
+
+    The runtime may answer a later fetch differently (a settlement may have
+    since been recorded); a report that was already persisted must still go
+    out with the content its sequence already stands for.
+    """
+    monkeypatch.setenv("DSH_DELIVERY_MAX_ATTEMPTS", "1")
+    monkeypatch.setenv("DSH_DELIVERY_RETRY_DELAY_SEC", "0.001")
+    queued_view = {**_NATIVE_VIEW, "settlementSeq": 10}
+    harness = _FakeHarness()
+    harness.client = _ViewClient(queued_view)
+    harness.notifications = _dispatch_notifications()[:1]
+    harness.gate.set()
+
+    class _Unavailable:
+        def post(self, url, payload, timeout):
+            raise OSError("not available")
+
+    config = DeepSeekHarnessConfig(dsh_home=str(tmp_path))
+    service = HarnessService(config, harness_factory=lambda _: harness, event_callback=_Unavailable())
+    run_id = service.start_run({
+        "instruction": "do not refetch", "session_id": "root-native",
+        "event_url": "http://a.invalid/v1/events",
+    })
+    _wait_for(lambda: service.run_state(run_id)["status"] == "completed", "the original run")
+    _wait_for(
+        lambda: service.run_state(run_id)["delivery_state"]["events"] == "failed",
+        "the failed delivery",
+    )
+    service.close()
+    harness.client = _ViewClient({**_NATIVE_VIEW, "settlementSeq": 999})
+
+    delivered: list[dict[str, Any]] = []
+
+    class _Events:
+        def post(self, url, payload, timeout):
+            delivered.append(payload)
+
+    def refuse_execution(_):
+        raise AssertionError("recovery must not start a harness")
+
+    recovered = HarnessService(config, harness_factory=refuse_execution, event_callback=_Events())
+    try:
+        _wait_for(
+            lambda: any(e["event"]["type"] == "llm/dispatch" for e in delivered),
+            "the recovered dispatch report",
+        )
+        report = next(e for e in delivered if e["event"]["type"] == "llm/dispatch")
+        assert report["request_view"] == queued_view
+        # Repeating a view is not a gap: no missing-view error may be recorded.
+        state = recovered.run_state(run_id)
+        assert "request_view" not in (state["delivery_state"].get("error") or "")
+    finally:
+        recovered.close()
+
+
+def test_a_none_view_decision_survives_restart_and_is_not_refetched(tmp_path, monkeypatch) -> None:
+    """A recorded gap is a decision, not a cache miss to answer again later.
+
+    The first attempt could not produce a view, so the report carries none and
+    the state records that explicitly. A restarted service that has a runtime
+    again must repeat that decision for the same dispatch instead of sending a
+    different body the second time.
+    """
+    import json
+
+    monkeypatch.setenv("DSH_DELIVERY_MAX_ATTEMPTS", "1")
+    monkeypatch.setenv("DSH_DELIVERY_RECOVERY_ATTEMPTS", "0")
+    monkeypatch.setenv("DSH_DELIVERY_RETRY_DELAY_SEC", "0.001")
+    harness = _FakeHarness()
+    harness.client = _ViewClient(_NATIVE_VIEW, fail_times=99)
+    harness.notifications = _dispatch_notifications()[:1]
+    harness.gate.set()
+
+    class _Unavailable:
+        def post(self, url, payload, timeout):
+            raise OSError("not available")
+
+    config = DeepSeekHarnessConfig(dsh_home=str(tmp_path))
+    service = HarnessService(config, harness_factory=lambda _: harness, event_callback=_Unavailable())
+    run_id = service.start_run({
+        "instruction": "keep the missing decision", "session_id": "root-native",
+        "event_url": "http://a.invalid/v1/events",
+    })
+    _wait_for(lambda: service.run_state(run_id)["status"] == "completed", "the original run")
+    _wait_for(
+        lambda: service.run_state(run_id)["delivery_state"]["events"] == "failed",
+        "the failed delivery",
+    )
+    assert harness.client.calls == [("root-native", 9)]
+    service.close()
+
+    record = json.loads((tmp_path / "evaluation-runs" / run_id / "state.json").read_text())
+    assert record["request_views"] == [
+        {"source_session_id": "root-native", "dispatch_seq": 9, "view": None},
+    ]
+
+    refetch = _ViewClient(_NATIVE_VIEW)
+    later = _FakeHarness()
+    later.client = refetch
+    delivered: list[dict[str, Any]] = []
+
+    class _Events:
+        def post(self, url, payload, timeout):
+            delivered.append(payload)
+
+    def refuse_execution(_):
+        raise AssertionError("recovery must not start a harness")
+
+    recovered = HarnessService(config, harness_factory=refuse_execution, event_callback=_Events())
+    try:
+        run = recovered._runs[run_id]
+        assert run.request_views == {("root-native", 9): None}
+        _wait_for(
+            lambda: any(e["event"]["type"] == "llm/dispatch" for e in delivered),
+            "the recovered dispatch report",
+        )
+        report = next(e for e in delivered if e["event"]["type"] == "llm/dispatch")
+        assert "request_view" not in report
+        # A runtime being available again does not reopen a recorded decision.
+        run.view_source = later
+        recovered._attach_request_view(run, report)
+        assert refetch.calls == []
+        assert "request_view" not in report
+    finally:
+        recovered.close()
+
+
+def test_an_error_turn_is_published_as_failed_with_its_evidence_kept() -> None:
+    """A harness that returns normally is not a completed case when the turn failed.
+
+    The runtime ends a turn with ``error`` and still reports idle, so the SDK
+    returns a result instead of raising. The service must publish that as a
+    failed run, name the reason, and keep the events and notifications the
+    result already carried: the trace and the diagnostic are the evidence, not
+    something the status change may discard.
+    """
+    failure_event = {
+        "type": "turn/end", "seq": 3, "time": 3,
+        "data": {"turn": 1, "reason": {"kind": "error", "error": {"code": "AUTH", "status": 401}}},
+    }
+    harness = _FakeHarness()
+    harness.finish_reason = "error"
+    harness.events = [
+        {"type": "turn/start", "seq": 1, "time": 1, "data": {"turn": 1}},
+        failure_event,
+    ]
+    harness.gate.set()
+    reports: list[dict[str, Any]] = []
+
+    class _Sink:
+        def post(self, url, payload, timeout):
+            reports.append(payload)
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(), harness_factory=lambda _: harness,
+        event_callback=_Sink(), result_callback=_Sink(),
+    )
+    try:
+        run_id = service.start_run({
+            "instruction": "fail with a reason", "session_id": "error-turn",
+            "event_url": "http://a.invalid/v1/events",
+            "callback_url": "http://benchmark.invalid/jobs/one/backend-result",
+        })
+        _wait_for(lambda: service.run_state(run_id)["status"] != "running", "the run to settle")
+        state = service.run_state(run_id)
+        assert state["status"] == "failed"
+        assert "error" in state["error"]
+        assert "AUTH" in state["error"] and "401" in state["error"]
+        assert state["finish_reason"] == "error"
+        assert state["events"] == harness.events
+        assert state["notifications"]
+
+        _wait_for(lambda: any(p.get("final") for p in reports), "the final report")
+        _wait_for(lambda: any("status" in p for p in reports), "the result report")
+        final = next(p for p in reports if p.get("final"))
+        outcome = next(p for p in reports if "status" in p)
+        assert final["event"]["data"]["status"] == "failed"
+        assert final["event"]["data"]["finish_reason"] == "error"
+        assert outcome["status"] == "failed"
+        assert outcome["result"]["finish_reason"] == "error"
+        assert outcome["result"]["final_response"] == "done"
+    finally:
+        service.close()
+
+
+def test_a_max_tokens_turn_follows_the_deployment_switch(monkeypatch) -> None:
+    """The deployment's own mapping decides whether a capped turn counts.
+
+    ``evaluation.patch.yml`` accepts ``max-tokens`` unless
+    ``DSH_MAX_TOKENS_AS_SUCCESS`` is JSON ``false``; the service shares that
+    environment with the runtime it starts. The finish reason stays visible in
+    both outcomes, so a capped answer is never silently rewritten as complete.
+    """
+    def run_once(finish_reason: str, switch: str | None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        if switch is None:
+            monkeypatch.delenv("DSH_MAX_TOKENS_AS_SUCCESS", raising=False)
+        else:
+            monkeypatch.setenv("DSH_MAX_TOKENS_AS_SUCCESS", switch)
+        harness = _FakeHarness()
+        harness.finish_reason = finish_reason
+        harness.gate.set()
+        reports: list[dict[str, Any]] = []
+
+        class _Sink:
+            def post(self, url, payload, timeout):
+                reports.append(payload)
+
+        service = HarnessService(
+            DeepSeekHarnessConfig(), harness_factory=lambda _: harness, result_callback=_Sink(),
+        )
+        try:
+            run_id = service.start_run({
+                "instruction": "hit the ceiling", "session_id": "capped",
+                "callback_url": "http://benchmark.invalid/jobs/one/backend-result",
+            })
+            _wait_for(lambda: service.run_state(run_id)["status"] != "running", "the run to settle")
+            return service.run_state(run_id), reports
+        finally:
+            service.close()
+
+    state, _reports = run_once("max-tokens", None)
+    assert state["status"] == "completed"
+    assert state["finish_reason"] == "max-tokens"
+
+    state, _reports = run_once("max-tokens", "false")
+    assert state["status"] == "failed"
+    assert "max-tokens" in state["error"]
+    assert state["finish_reason"] == "max-tokens"
+
+
+def test_a_return_without_a_turn_end_is_not_published_as_completed() -> None:
+    """A run that produced no ended turn has no outcome to call a success.
+
+    ``finish_reason`` is ``None`` when the run interval held no ``turn/end``.
+    Publishing that as completed would claim a verdict the runtime never
+    produced, so it is a failed run naming the missing reason.
+    """
+    harness = _FakeHarness()
+    harness.finish_reason = None
+    harness.gate.set()
+    service = _service(harness)
+    try:
+        run_id = service.start_run({"instruction": "no turn end", "session_id": "silent"})
+        _wait_for(lambda: service.run_state(run_id)["status"] != "running", "the run to settle")
+        state = service.run_state(run_id)
+        assert state["status"] == "failed"
+        assert "turn ended with None" in state["error"]
+        assert state["finish_reason"] is None
+    finally:
+        service.close()
+
+
+def test_a_legacy_succeeded_state_with_an_error_finish_is_corrected_on_recovery(tmp_path) -> None:
+    """A state written before the outcome followed the finish reason is repaired.
+
+    The recorded run 77c40199… said ``terminal_status=succeeded`` while its
+    result carried ``finish_reason=error``. Recovery re-reads the persisted
+    result, publishes the truthful status, and keeps every recorded event.
+    """
+    import json
+
+    home = tmp_path / "home"
+    directory = home / "evaluation-runs" / "legacy-error-run"
+    directory.mkdir(parents=True)
+    failure = {
+        "type": "turn/end", "seq": 3, "time": 3,
+        "data": {"turn": 1, "reason": {"kind": "error", "error": {"code": "AUTH", "status": 401}}},
+    }
+    (directory / "state.json").write_text(json.dumps({
+        "protocol_version": "2.0", "run_id": "legacy-error-run",
+        "task_id": "case", "session_id": "legacy-session", "instruction": "old task",
+        "callback_url": "http://b.invalid/jobs/one/backend-result",
+        "event_url": "http://a.invalid/v1/events",
+        "request_id": "", "request_digest": "",
+        "evaluation_id": "eval", "case_id": "case", "run_user": "", "cwd": "",
+        "agent_preset": "", "model": "m", "benchmark": "b", "question_type": "unknown",
+        "dataset_version": "", "dataset_sha256": "",
+        "reported": 2, "undelivered": [], "reports_closed": True,
+        "event_delivery": "delivered", "result_delivery": "delivered",
+        "result_report": None,
+        "result": {
+            "final_response": "", "finish_reason": "error", "session_id": "legacy-session",
+            "events": [failure], "notifications": [],
+        },
+        "error": None, "cancel_state": "none", "terminal_status": "succeeded", "done": True,
+    }))
+    delivered: list[dict[str, Any]] = []
+
+    class _Sink:
+        def post(self, url, payload, timeout):
+            delivered.append(payload)
+
+    def refuse_execution(_):
+        raise AssertionError("recovery must not start a harness")
+
+    recovered = HarnessService(
+        DeepSeekHarnessConfig(dsh_home=str(home)), harness_factory=refuse_execution,
+        event_callback=_Sink(), result_callback=_Sink(),
+    )
+    try:
+        state = recovered.run_state("legacy-error-run")
+        assert state["status"] == "failed"
+        assert "AUTH" in state["error"] and "401" in state["error"]
+        assert state["finish_reason"] == "error"
+        assert state["events"] == [failure]
+        _wait_for(lambda: bool(delivered), "the corrected reports")
+        outcome = next(p for p in delivered if "status" in p)
+        assert outcome["status"] == "failed"
+        assert outcome["result"]["finish_reason"] == "error"
+    finally:
+        recovered.close()
+
+
+def test_a_pending_legacy_result_report_is_corrected_with_the_recovered_status(tmp_path) -> None:
+    """A queued result the evaluator never received is still a draft.
+
+    The recorded state claimed ``succeeded`` and held a result report with the
+    same status, but its result carried ``finish_reason=error`` and the report
+    was never delivered. Recovery must publish the truthful status on that
+    report instead of sending a success the turn never produced.
+    """
+    import json
+
+    home = tmp_path / "home"
+    directory = home / "evaluation-runs" / "legacy-pending-result"
+    directory.mkdir(parents=True)
+    failure = {
+        "type": "turn/end", "seq": 3, "time": 3,
+        "data": {"turn": 1, "reason": {"kind": "error", "error": {"code": "AUTH", "status": 401}}},
+    }
+    stored_result = {
+        "final_response": "", "finish_reason": "error", "session_id": "legacy-session",
+        "events": [failure], "notifications": [],
+    }
+    (directory / "state.json").write_text(json.dumps({
+        "protocol_version": "2.0", "run_id": "legacy-pending-result",
+        "task_id": "case", "session_id": "legacy-session", "instruction": "old task",
+        "callback_url": "http://b.invalid/jobs/one/backend-result",
+        "event_url": "http://a.invalid/v1/events",
+        "request_id": "", "request_digest": "",
+        "evaluation_id": "eval", "case_id": "case", "run_user": "", "cwd": "",
+        "agent_preset": "", "model": "m", "benchmark": "b", "question_type": "unknown",
+        "dataset_version": "", "dataset_sha256": "",
+        "reported": 2, "undelivered": [], "reports_closed": True,
+        "event_delivery": "delivered", "result_delivery": "failed",
+        "result_report": {
+            "protocol_version": "2.0", "run_id": "legacy-pending-result",
+            "request_id": "", "evaluation_id": "eval", "case_id": "case",
+            "model": "m", "status": "succeeded", "session_id": "legacy-session",
+            "task_id": "case", "result": stored_result, "error": None,
+        },
+        "result": stored_result,
+        "error": None, "cancel_state": "none", "terminal_status": "succeeded", "done": True,
+    }))
+    delivered: list[dict[str, Any]] = []
+
+    class _Sink:
+        def post(self, url, payload, timeout):
+            delivered.append(payload)
+
+    def refuse_execution(_):
+        raise AssertionError("recovery must not start a harness")
+
+    recovered = HarnessService(
+        DeepSeekHarnessConfig(dsh_home=str(home)), harness_factory=refuse_execution,
+        event_callback=_Sink(), result_callback=_Sink(),
+    )
+    try:
+        assert recovered.run_state("legacy-pending-result")["status"] == "failed"
+        _wait_for(lambda: bool(delivered), "the queued result report")
+        outcome = next(p for p in delivered if "status" in p)
+        assert outcome["status"] == "failed"
+        assert "AUTH" in outcome["error"] and "401" in outcome["error"]
+        assert outcome["result"]["finish_reason"] == "error"
+        record = json.loads((directory / "state.json").read_text())
+        assert record["terminal_status"] == "failed"
+        assert record["result_report"]["status"] == "failed"
+        assert record["result"]["events"] == [failure]
+    finally:
+        recovered.close()
+
+
+def test_a_pending_legacy_final_event_is_corrected_with_the_recovered_status(tmp_path) -> None:
+    """A queued final event is a draft too, and must not claim a success.
+
+    The same recorded state queued its ``run/end`` report with
+    ``status=succeeded`` before it was ever delivered. Recovery corrects the
+    terminal status, so the queued final event must carry the same failure;
+    an evaluator reading only the event channel would otherwise be told the
+    turn succeeded.
+    """
+    import json
+
+    home = tmp_path / "home"
+    directory = home / "evaluation-runs" / "legacy-pending-final"
+    directory.mkdir(parents=True)
+    failure = {
+        "type": "turn/end", "seq": 3, "time": 3,
+        "data": {"turn": 1, "reason": {"kind": "error", "error": {"code": "AUTH", "status": 401}}},
+    }
+    stored_result = {
+        "final_response": "", "finish_reason": "error", "session_id": "legacy-session",
+        "events": [failure], "notifications": [],
+    }
+    queued_final = {
+        "protocol_version": "2.0", "evaluation_id": "eval", "case_id": "case",
+        "model": "m", "harness": "APUS", "benchmark": "b",
+        "dataset_version": "", "dataset_sha256": "", "question_type": "unknown",
+        "source_session_id": "legacy-session:service", "root_session_id": "legacy-session",
+        "seq": 1, "first_seq": 1, "final": True, "question": "old task", "run_user": "",
+        "delivery_seq": 3,
+        "event": {
+            "type": "run/end", "seq": 1, "time": 4,
+            "data": {"status": "succeeded", "finish_reason": "error", "final_response": "", "error": None},
+        },
+    }
+    (directory / "state.json").write_text(json.dumps({
+        "protocol_version": "2.0", "run_id": "legacy-pending-final",
+        "task_id": "case", "session_id": "legacy-session", "instruction": "old task",
+        "callback_url": "", "event_url": "http://a.invalid/v1/events",
+        "request_id": "", "request_digest": "",
+        "evaluation_id": "eval", "case_id": "case", "run_user": "", "cwd": "",
+        "agent_preset": "", "model": "m", "benchmark": "b", "question_type": "unknown",
+        "dataset_version": "", "dataset_sha256": "",
+        "reported": 3, "undelivered": [{
+            "protocol_version": "2.0", "evaluation_id": "eval", "case_id": "case",
+            "model": "m", "harness": "APUS", "benchmark": "b",
+            "dataset_version": "", "dataset_sha256": "", "question_type": "unknown",
+            "source_session_id": "legacy-session", "root_session_id": "legacy-session",
+            "seq": 1, "first_seq": 1, "final": False, "question": "old task", "run_user": "",
+            "delivery_seq": 2,
+            "event": {"type": "turn/start", "seq": 1, "time": 2, "data": {"turn": 1}},
+        }, queued_final], "reports_closed": True,
+        "event_delivery": "failed", "result_delivery": "delivered",
+        "result_report": None,
+        "result": stored_result,
+        "error": None, "cancel_state": "none", "terminal_status": "succeeded", "done": True,
+    }))
+    delivered: list[dict[str, Any]] = []
+
+    class _Sink:
+        def post(self, url, payload, timeout):
+            delivered.append(payload)
+
+    def refuse_execution(_):
+        raise AssertionError("recovery must not start a harness")
+
+    recovered = HarnessService(
+        DeepSeekHarnessConfig(dsh_home=str(home)), harness_factory=refuse_execution,
+        event_callback=_Sink(),
+    )
+    try:
+        _wait_for(lambda: len(delivered) >= 2, "both queued events")
+        # Only the terminal record carries an outcome; a source event keeps
+        # its own body untouched.
+        source = next(p for p in delivered if not p.get("final"))
+        assert source["event"] == {"type": "turn/start", "seq": 1, "time": 2, "data": {"turn": 1}}
+        assert source["delivery_seq"] == 2
+        report = next(p for p in delivered if p.get("final"))
+        assert report["event"]["data"]["status"] == "failed"
+        assert "AUTH" in report["event"]["data"]["error"]
+        assert report["delivery_seq"] == 3
+        record = json.loads((directory / "state.json").read_text())
+        assert record["terminal_status"] == "failed"
+    finally:
+        recovered.close()
+
+
+def test_a_delivered_legacy_result_report_is_never_rewritten(tmp_path) -> None:
+    """History stays history: a report the evaluator received is not resent or edited.
+
+    Recovery still corrects the run's published status, because the run query
+    is a live view. The result report that already reached the evaluator is
+    the record of what it was told, so recovery leaves its bytes alone and
+    does not open another result delivery.
+    """
+    import json
+
+    home = tmp_path / "home"
+    directory = home / "evaluation-runs" / "legacy-delivered-result"
+    directory.mkdir(parents=True)
+    delivered_report = {
+        "protocol_version": "2.0", "run_id": "legacy-delivered-result",
+        "request_id": "", "evaluation_id": "eval", "case_id": "case",
+        "model": "m", "status": "succeeded", "session_id": "legacy-session",
+        "task_id": "case",
+        "result": {"final_response": "", "finish_reason": "error", "session_id": "legacy-session"},
+        "error": None,
+    }
+    (directory / "state.json").write_text(json.dumps({
+        "protocol_version": "2.0", "run_id": "legacy-delivered-result",
+        "task_id": "case", "session_id": "legacy-session", "instruction": "old task",
+        "callback_url": "http://b.invalid/jobs/one/backend-result",
+        "event_url": "http://a.invalid/v1/events",
+        "request_id": "", "request_digest": "",
+        "evaluation_id": "eval", "case_id": "case", "run_user": "", "cwd": "",
+        "agent_preset": "", "model": "m", "benchmark": "b", "question_type": "unknown",
+        "dataset_version": "", "dataset_sha256": "",
+        "reported": 2, "undelivered": [], "reports_closed": True,
+        "event_delivery": "delivered", "result_delivery": "delivered",
+        "result_report": delivered_report,
+        "result": {
+            "final_response": "", "finish_reason": "error", "session_id": "legacy-session",
+            "events": [], "notifications": [],
+        },
+        "error": None, "cancel_state": "none", "terminal_status": "succeeded", "done": True,
+    }))
+    calls: list[dict[str, Any]] = []
+
+    class _Sink:
+        def post(self, url, payload, timeout):
+            calls.append(payload)
+
+    def refuse_execution(_):
+        raise AssertionError("recovery must not start a harness")
+
+    recovered = HarnessService(
+        DeepSeekHarnessConfig(dsh_home=str(home)), harness_factory=refuse_execution,
+        result_callback=_Sink(),
+    )
+    try:
+        state = recovered.run_state("legacy-delivered-result")
+        assert state["status"] == "failed"
+        assert state["error"]
+        record = json.loads((directory / "state.json").read_text())
+        assert record["terminal_status"] == "failed"
+        assert record["result_delivery"] == "delivered"
+        assert record["result_report"] == delivered_report
+    finally:
+        # Closing waits for any sender; nothing may have been posted at all.
+        recovered.close()
+    assert calls == []
+
+
+def test_an_aborted_turn_is_a_failure_that_keeps_its_evidence() -> None:
+    """A turn the runtime reports as ``aborted`` is not a completed case.
+
+    Cancellation publishes ``cancelled``; an abort that reached the turn end
+    without a cancel is a failed case. Its result stays available so the trace
+    and diagnostic that explain it survive the status change.
+    """
+    harness = _FakeHarness()
+    harness.finish_reason = "aborted"
+    harness.events = [{"type": "turn/end", "seq": 2, "time": 2, "data": {"turn": 1, "reason": {"kind": "aborted"}}}]
+    harness.gate.set()
+    service = _service(harness)
+    try:
+        run_id = service.start_run({"instruction": "abort", "session_id": "aborted-turn"})
+        _wait_for(lambda: service.run_state(run_id)["status"] != "running", "the run to settle")
+        state = service.run_state(run_id)
+        assert state["status"] == "failed"
+        assert "aborted" in state["error"]
+        assert state["finish_reason"] == "aborted"
+        assert state["events"] == harness.events
+    finally:
+        service.close()
+
+
+def test_store_failure_is_reported_as_a_gap_not_as_persistence(tmp_path, monkeypatch) -> None:
+    """A failed save must stay visible as missing evidence.
+
+    The run keeps executing after a write failure, so its in-memory state is
+    newer than anything on disk. The service must name the storage gap in the
+    delivery state, and the file it left behind must still say the run was not
+    done: restoring that file must not be read later as a finished run.
+    """
+    import json
+
+    harness = _FakeHarness()
+    harness.gate.set()
+    accepted: list[dict[str, Any]] = []
+
+    class _Sink:
+        def post(self, url, payload, timeout):
+            accepted.append(payload)
+
+    service = HarnessService(
+        DeepSeekHarnessConfig(dsh_home=str(tmp_path)), harness_factory=lambda _: harness,
+        event_callback=_Sink(),
+    )
+    original = service._persist_run
+    calls = {"count": 0}
+
+    def fail_after_the_first_write(run):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            original(run)
+            return
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service, "_persist_run", fail_after_the_first_write)
+    try:
+        run_id = service.start_run({
+            "instruction": "run", "session_id": "store-failure",
+            "event_url": "http://a.invalid/v1/events",
+        })
+        _wait_for(lambda: service.run_state(run_id)["status"] == "completed", "the run to settle")
+        state = service.run_state(run_id)
+        assert "report storage failed" in state["delivery_state"]["error"]
+        assert "OSError" in state["delivery_state"]["error"]
+        record = json.loads((tmp_path / "evaluation-runs" / run_id / "state.json").read_text())
+        assert record["done"] is False
+        assert record["terminal_status"] is None
+    finally:
+        service.close()
+
+
+def test_a_state_already_corrected_to_failed_still_fixes_its_queued_drafts(tmp_path) -> None:
+    """Recovery is repeatable: a second restart must finish the same repair.
+
+    An earlier build corrected ``terminal_status`` to ``failed`` and persisted
+    that, but left the queued result report and final event at ``succeeded``.
+    Restarting with this build must correct those drafts too; otherwise the
+    evaluator is told failure in the run query and success on its callbacks.
+    """
+    import json
+
+    home = tmp_path / "home"
+    directory = home / "evaluation-runs" / "legacy-twice"
+    directory.mkdir(parents=True)
+    failure = {
+        "type": "turn/end", "seq": 3, "time": 3,
+        "data": {"turn": 1, "reason": {"kind": "error", "error": {"code": "AUTH", "status": 401}}},
+    }
+    stored_result = {
+        "final_response": "", "finish_reason": "error", "session_id": "legacy-session",
+        "events": [failure], "notifications": [],
+    }
+    queued_final = {
+        "protocol_version": "2.0", "evaluation_id": "eval", "case_id": "case",
+        "model": "m", "harness": "APUS", "benchmark": "b",
+        "dataset_version": "", "dataset_sha256": "", "question_type": "unknown",
+        "source_session_id": "legacy-session:service", "root_session_id": "legacy-session",
+        "seq": 1, "first_seq": 1, "final": True, "question": "old task", "run_user": "",
+        "delivery_seq": 2,
+        "event": {
+            "type": "run/end", "seq": 1, "time": 4,
+            "data": {"status": "succeeded", "finish_reason": "error", "final_response": "", "error": None},
+        },
+    }
+    (directory / "state.json").write_text(json.dumps({
+        "protocol_version": "2.0", "run_id": "legacy-twice",
+        "task_id": "case", "session_id": "legacy-session", "instruction": "old task",
+        "callback_url": "http://b.invalid/jobs/one/backend-result",
+        "event_url": "http://a.invalid/v1/events",
+        "request_id": "", "request_digest": "",
+        "evaluation_id": "eval", "case_id": "case", "run_user": "", "cwd": "",
+        "agent_preset": "", "model": "m", "benchmark": "b", "question_type": "unknown",
+        "dataset_version": "", "dataset_sha256": "",
+        "reported": 2, "undelivered": [queued_final], "reports_closed": True,
+        "event_delivery": "failed", "result_delivery": "failed",
+        "result_report": {
+            "protocol_version": "2.0", "run_id": "legacy-twice",
+            "request_id": "", "evaluation_id": "eval", "case_id": "case",
+            "model": "m", "status": "succeeded", "session_id": "legacy-session",
+            "task_id": "case", "result": dict(stored_result), "error": None,
+        },
+        "result": stored_result,
+        "error": "turn ended with 'error': AUTH 401", "cancel_state": "none",
+        "terminal_status": "failed", "done": True,
+    }))
+    delivered: list[dict[str, Any]] = []
+
+    class _Sink:
+        def post(self, url, payload, timeout):
+            delivered.append(payload)
+
+    def refuse_execution(_):
+        raise AssertionError("recovery must not start a harness")
+
+    recovered = HarnessService(
+        DeepSeekHarnessConfig(dsh_home=str(home)), harness_factory=refuse_execution,
+        event_callback=_Sink(), result_callback=_Sink(),
+    )
+    try:
+        _wait_for(lambda: len(delivered) >= 2, "both queued drafts")
+        outcome = next(p for p in delivered if "status" in p)
+        final = next(p for p in delivered if p.get("final"))
+        assert outcome["status"] == "failed"
+        assert "AUTH" in outcome["error"]
+        assert final["event"]["data"]["status"] == "failed"
+        assert final["delivery_seq"] == 2
+    finally:
+        recovered.close()
+
+
+def test_a_recovered_cancelled_run_is_not_rewritten_as_failed(tmp_path) -> None:
+    """A confirmed cancellation keeps ``cancelled``; only turn outcomes are mapped."""
+    import json
+
+    home = tmp_path / "home"
+    directory = home / "evaluation-runs" / "legacy-cancelled"
+    directory.mkdir(parents=True)
+    (directory / "state.json").write_text(json.dumps({
+        "protocol_version": "2.0", "run_id": "legacy-cancelled",
+        "task_id": "case", "session_id": "legacy-session", "instruction": "old task",
+        "callback_url": "", "event_url": "",
+        "request_id": "", "request_digest": "",
+        "evaluation_id": "eval", "case_id": "case", "run_user": "", "cwd": "",
+        "agent_preset": "", "model": "m", "benchmark": "b", "question_type": "unknown",
+        "dataset_version": "", "dataset_sha256": "",
+        "reported": 1, "undelivered": [], "reports_closed": True,
+        "event_delivery": "delivered", "result_delivery": "idle",
+        "result_report": None,
+        "result": {"final_response": "", "finish_reason": "aborted", "session_id": "legacy-session",
+                   "events": [], "notifications": []},
+        "error": None, "cancel_state": "cancelled",
+        "terminal_status": "cancelled", "done": True,
+    }))
+
+    def refuse_execution(_):
+        raise AssertionError("recovery must not start a harness")
+
+    recovered = HarnessService(
+        DeepSeekHarnessConfig(dsh_home=str(home)), harness_factory=refuse_execution,
+    )
+    try:
+        assert recovered.run_state("legacy-cancelled")["status"] == "cancelled"
+        record = json.loads((directory / "state.json").read_text())
+        assert record["terminal_status"] == "cancelled"
+    finally:
+        recovered.close()
+
+
+def test_a_recovered_in_flight_cancellation_is_not_turned_into_a_turn_failure(tmp_path) -> None:
+    """A state caught mid-cancellation keeps its own status.
+
+    The turn end says ``aborted``, which would map to a failed case, but the
+    run is still cancelling: rewriting the status on disk while the run query
+    says ``cancelling`` publishes two different answers for one run.
+    """
+    import json
+
+    home = tmp_path / "home"
+    directory = home / "evaluation-runs" / "stuck-cancelling"
+    directory.mkdir(parents=True)
+    (directory / "state.json").write_text(json.dumps({
+        "protocol_version": "2.0", "run_id": "stuck-cancelling",
+        "task_id": "case", "session_id": "legacy-session", "instruction": "old task",
+        "callback_url": "", "event_url": "",
+        "request_id": "", "request_digest": "",
+        "evaluation_id": "eval", "case_id": "case", "run_user": "", "cwd": "",
+        "agent_preset": "", "model": "m", "benchmark": "b", "question_type": "unknown",
+        "dataset_version": "", "dataset_sha256": "",
+        "reported": 1, "undelivered": [], "reports_closed": True,
+        "event_delivery": "delivered", "result_delivery": "idle",
+        "result_report": None,
+        "result": {"final_response": "", "finish_reason": "aborted", "session_id": "legacy-session",
+                   "events": [], "notifications": []},
+        "error": None, "cancel_state": "cancelling",
+        "terminal_status": "cancelled", "done": True,
+    }))
+
+    def refuse_execution(_):
+        raise AssertionError("recovery must not start a harness")
+
+    recovered = HarnessService(
+        DeepSeekHarnessConfig(dsh_home=str(home)), harness_factory=refuse_execution,
+    )
+    try:
+        assert recovered.run_state("stuck-cancelling")["status"] == "cancelling"
+        record = json.loads((directory / "state.json").read_text())
+        # Whatever the query says must match what is written down.
+        assert record["terminal_status"] == "cancelled"
+    finally:
+        recovered.close()
+
+
+_RUNTIME_SCRIPT = '''
+import json, sys
+VIEW = {
+    "sessionId": "s", "dispatchSeq": 10, "prefixEnd": 9, "turn": 1, "step": 1,
+    "header": {"config": {"provider": "p", "model": "m"}},
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "over the wire"}]}],
+    "toolHistory": {"tools": [], "updates": []},
+    "settlementSeq": 11, "projectionTypes": ["image/offload"],
+}
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method, rid = msg.get("method"), msg.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "serverInfo": {"name": "fake-runtime", "version": "0"},
+            "capabilities": ["request-view/dispatch-v1"],
+        }})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"messageId": "m1"}})
+        send({"jsonrpc": "2.0", "method": "session.event", "params": {"sessionId": "s", "event": {
+            "type": "agent/inbox/spliced", "seq": 1, "time": 1,
+            "data": {"inserted": [{"id": "m1"}]}}}})
+        send({"jsonrpc": "2.0", "method": "session.event", "params": {"sessionId": "s", "event": {
+            "type": "llm/dispatch", "seq": 10, "time": 2,
+            "data": {"sessionId": "s", "prefixEnd": 9, "turn": 1, "step": 1}}}})
+        send({"jsonrpc": "2.0", "method": "session.event", "params": {"sessionId": "s", "event": {
+            "type": "assistant/message", "seq": 11, "time": 3,
+            "data": {"turn": 1, "step": 1, "message": {
+                "role": "assistant", "id": "a1", "source": {"kind": "model"},
+                "content": [{"type": "text", "text": "ok"}]}}}}})
+        send({"jsonrpc": "2.0", "method": "session.event", "params": {"sessionId": "s", "event": {
+            "type": "llm/dispatch-settled", "seq": 12, "time": 4,
+            "data": {"sessionId": "s", "dispatchSeq": 10, "settlementSeq": 11}}}})
+        send({"jsonrpc": "2.0", "method": "session.event", "params": {"sessionId": "s", "event": {
+            "type": "turn/end", "seq": 13, "time": 5,
+            "data": {"turn": 1, "reason": {"kind": "completed"}}}}})
+        send({"jsonrpc": "2.0", "method": "session.status", "params": {"sessionId": "s", "status": "idle"}})
+    elif method == "session/request-view":
+        params = msg.get("params") or {}
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            **VIEW, "sessionId": params.get("sessionId", "s"),
+            "dispatchSeq": params.get("dispatchSeq", 10)}})
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        break
+'''
+
+
+def test_the_view_arrives_over_the_runtime_wire_not_a_stand_in(tmp_path) -> None:
+    """The sidecar is fetched through the SDK's own JSON-RPC client.
+
+    A stubbed client would prove the sender-thread placement and nothing about
+    the real seam: method name, params, envelope validation, and the refusal
+    path all live in the client. This runtime answers over stdio instead.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    script = tmp_path / "fake_runtime.py"
+    script.write_text(f"#!{sys.executable}\n{_RUNTIME_SCRIPT}", encoding="utf-8")
+    script.chmod(0o755)
+    reports: list[dict[str, Any]] = []
+
+    class _Events:
+        def post(self, url: str, payload: dict[str, Any], timeout: float) -> None:
+            reports.append(payload)
+
+    config = DeepSeekHarnessConfig(
+        dsh_bin=str(script), dsh_home=str(home), cwd=str(tmp_path), env={},
+    )
+    service = HarnessService(config, event_callback=_Events())
+    try:
+        service.start_run({
+            "instruction": "do it", "session_id": "s",
+            "event_url": "http://events.invalid/v1/events",
+        })
+        _wait_for(
+            lambda: any(r["event"]["type"] == "llm/dispatch" for r in reports),
+            "the dispatch report over the real wire",
+        )
+        _wait_for(
+            lambda: any(r["event"]["type"] == "llm/dispatch-settled" for r in reports),
+            "the settled report over the real wire",
+        )
+        dispatch = next(r for r in reports if r["event"]["type"] == "llm/dispatch")
+        settled = next(r for r in reports if r["event"]["type"] == "llm/dispatch-settled")
+        assert dispatch["request_view"]["messages"][0]["content"][0]["text"] == "over the wire"
+        assert dispatch["request_view"]["projectionTypes"] == ["image/offload"]
+        assert settled["request_view"]["dispatchSeq"] == 10
+    finally:
+        service.close()
+
+
+def test_two_sessions_with_the_same_dispatch_seq_keep_their_own_views() -> None:
+    """Dispatch seqs are per session; a parent and a child both open at seq 10.
+
+    A cache keyed by seq alone would hand the child the root's request view,
+    which is a different model call. The view a report carries must belong to
+    the session that report names.
+    """
+    root_view = {**_NATIVE_VIEW, "sessionId": "root-native", "dispatchSeq": 10,
+                 "messages": [{"role": "user", "content": [{"type": "text", "text": "root call"}]}]}
+    child_view = {**_NATIVE_VIEW, "sessionId": "child-native", "dispatchSeq": 10,
+                  "messages": [{"role": "user", "content": [{"type": "text", "text": "child call"}]}]}
+
+    class _TwoViewClient:
+        calls: list[tuple[str, int]] = []
+
+        def session_request_view(self, session_id: str, dispatch_seq: int) -> dict[str, Any]:
+            type(self).calls.append((session_id, dispatch_seq))
+            return dict(root_view if session_id == "root-native" else child_view)
+
+    harness = _FakeHarness()
+    harness.client = _TwoViewClient()
+    harness.notifications = [
+        Notification(method="session.event", payload={"sessionId": "root-native", "event": {
+            "type": "llm/dispatch", "seq": 10, "time": 1,
+            "data": {"sessionId": "root-native", "prefixEnd": 9, "turn": 1, "step": 1},
+        }}),
+        Notification(method="session.event", payload={"sessionId": "child-native", "event": {
+            "type": "llm/dispatch", "seq": 10, "time": 2,
+            "data": {"sessionId": "child-native", "prefixEnd": 9, "turn": 1, "step": 1},
+        }}),
+    ]
+    harness.gate.set()
+    events: list[dict[str, Any]] = []
+    service = _collecting_service(harness, events)
+    try:
+        service.start_run({
+            "instruction": "delegate", "session_id": "root-native",
+            "event_url": "http://events.invalid/v1/events",
+        })
+        _wait_for(lambda: len(events) >= 2, "both dispatch reports")
+        by_session = {e["source_session_id"]: e for e in events if not e.get("final")}
+        assert by_session["root-native"]["request_view"]["messages"][0]["content"][0]["text"] == "root call"
+        assert by_session["child-native"]["request_view"]["messages"][0]["content"][0]["text"] == "child call"
+        assert sorted(_TwoViewClient.calls) == [("child-native", 10), ("root-native", 10)]
     finally:
         service.close()

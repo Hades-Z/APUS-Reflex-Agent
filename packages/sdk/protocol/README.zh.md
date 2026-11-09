@@ -44,7 +44,7 @@ kind: "package-library"
 | client→server | `session/request-view` | `SessionRequestViewParams` → `SessionRequestViewResult`（一次派发重建后的模型输入；需要 `request-view/dispatch-v1`） |
 | client→server | `shutdown` | 无参数 → `{}` |
 | server→client | `session.event` | `SessionEventNotification`（运行时内每个会话，不过滤） |
-| server→client | `session.status` | `SessionStatusNotification`（整个 agent（智能体）的 `running`/`idle` 转换） |
+| server→client | `session.status` | `SessionStatusNotification`（整个 agent（智能体）的 `running`/`idle` 转换；`idle` 可带可选 `settlement` 结果） |
 | server→client | `subagent.started` | `SubagentStartedNotification` |
 | server→client | `subagent.finished` | `SubagentFinishedNotification`（仅进程内运行） |
 

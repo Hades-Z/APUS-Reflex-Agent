@@ -10,7 +10,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage, LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -360,6 +360,88 @@ function registerEcho(ctx: Context): void {
     },
   }))
 }
+
+describe('dispatch settlement barrier', () => {
+  it('resolves immediately when no settlement record is queued', async () => {
+    const adapter = new RecordingAdapter([textResponse('one')])
+    const ctx = await makeHarness(adapter)
+    const dispose = installRequestDispatchRecorder(ctx)
+    try {
+      await expect(dispose.whenSettled(SessionId('nothing-queued'))).resolves.toBeUndefined()
+    } finally {
+      dispose()
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('waits for the scheduled settlement record instead of reporting the dispatch settled early', async () => {
+    const adapter = new RecordingAdapter([textResponse('settled')])
+    const ctx = await makeHarness(adapter)
+    const dispose = installRequestDispatchRecorder(ctx)
+    // The settlement record is appended from a queued microtask; holding that
+    // queue makes the intermediate state observable.
+    const queued: (() => void)[] = []
+    const realQueueMicrotask = globalThis.queueMicrotask
+    let hold = true
+    vi.stubGlobal('queueMicrotask', (task: () => void) => {
+      if (hold) queued.push(task)
+      else realQueueMicrotask(task)
+    })
+    try {
+      const agent = await ctx.agentLoop.create(SessionId('dispatch-barrier'), { provider: 'mock', model: 'mock' })
+      let waiting: Promise<void> | undefined
+      let settledRecordsAtWait: number | undefined
+      let waiterDone = false
+      ctx.on('session/event', (session, event) => {
+        if (event.type !== 'assistant/message' || String(session.id) !== 'dispatch-barrier') return
+        settledRecordsAtWait = session.snapshotEvents()
+          .filter(candidate => candidate.type === 'llm/dispatch-settled').length
+        waiting = dispose.whenSettled(session.id).then(() => { waiterDone = true })
+      })
+      send(agent, 'go')
+      await waitForIdle(ctx, agent)
+      expect(settledRecordsAtWait).toBe(0)
+      // The settlement record is still queued: the barrier has not resolved.
+      expect(waiterDone).toBe(false)
+      expect(sessionEvents(agent.session).filter(event => event.type === 'llm/dispatch-settled')).toHaveLength(0)
+      hold = false
+      for (const task of queued.splice(0)) task()
+      await waiting
+      expect(waiterDone).toBe(true)
+      expect(sessionEvents(agent.session).filter(event => event.type === 'llm/dispatch-settled')).toHaveLength(1)
+    } finally {
+      vi.unstubAllGlobals()
+      dispose()
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('releases a pending settlement waiter when the recorder is removed', async () => {
+    const adapter = new RecordingAdapter([textResponse('settled')])
+    const ctx = await makeHarness(adapter)
+    const dispose = installRequestDispatchRecorder(ctx)
+    const queued: (() => void)[] = []
+    vi.stubGlobal('queueMicrotask', (task: () => void) => { queued.push(task) })
+    try {
+      const agent = await ctx.agentLoop.create(SessionId('dispatch-uninstall'), { provider: 'mock', model: 'mock' })
+      let waiting: Promise<void> | undefined
+      ctx.on('session/event', (session, event) => {
+        if (event.type !== 'assistant/message' || String(session.id) !== 'dispatch-uninstall') return
+        waiting = dispose.whenSettled(session.id)
+      })
+      send(agent, 'go')
+      await waitForIdle(ctx, agent)
+      expect(waiting).toBeDefined()
+      // Removal drops the queued record; the waiter must not wait forever.
+      dispose()
+      await expect(waiting).resolves.toBeUndefined()
+    } finally {
+      vi.unstubAllGlobals()
+      queued.splice(0)
+      await ctx.fiber.dispose()
+    }
+  })
+})
 
 describe('buildRequestView', () => {
   it('rebuilds messages, tools, and tool history byte-equal to the controlled adapter capture', async () => {

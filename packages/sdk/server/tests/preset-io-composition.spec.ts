@@ -27,7 +27,12 @@ import * as RemoteSubprocess from '@deepseek-ai/dsh-subprocess-remote'
 import * as ToolFs from '@deepseek-ai/dsh-tool-fs'
 import * as ToolSearch from '@deepseek-ai/dsh-tool-fs-search'
 import * as ToolBash from '@deepseek-ai/dsh-tool-bash'
+import * as AgentInstructions from '@deepseek-ai/dsh-agent-instructions'
+import * as SkillRegistry from '@deepseek-ai/dsh-skill'
+import * as SkillFileSystem from '@deepseek-ai/dsh-skill-filesystem'
+import { agentEvents } from '@deepseek-ai/dsh-agent'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import type { UserMessage } from '@deepseek-ai/dsh-session'
 
 const execute = promisify(execFile)
 
@@ -77,6 +82,8 @@ it.skipIf(process.platform === 'win32')('keeps Host I/O local and routes task to
     ['@deepseek-ai/dsh-bash-local', LocalShell], ['@deepseek-ai/dsh-subprocess-local', LocalSubprocess],
     ['@deepseek-ai/dsh-shell-env', ShellEnv], ['@deepseek-ai/dsh-tool-fs', ToolFs],
     ['@deepseek-ai/dsh-tool-fs-search', ToolSearch], ['@deepseek-ai/dsh-tool-bash', ToolBash],
+    ['@deepseek-ai/dsh-agent-instructions', AgentInstructions],
+    ['@deepseek-ai/dsh-skill', SkillRegistry], ['@deepseek-ai/dsh-skill-filesystem', SkillFileSystem],
     ['file:///workspace/packages/preset/agent-preset-registry/lib/index.js', Presets],
     ['file:///workspace/packages/preset/agent-preset/lib/index.js', Preset],
     ['file:///workspace/packages/fs/fs-remote/lib/index.js', RemoteFs],
@@ -95,6 +102,9 @@ it.skipIf(process.platform === 'win32')('keeps Host I/O local and routes task to
     { id: 'tools', name: '@deepseek-ai/dsh-tools' },
     { id: 'agents', name: '@deepseek-ai/dsh-agent' },
     { id: 'loop', name: '@deepseek-ai/dsh-agent-loop', config: { agents: [] } },
+    // The deployed profile's `skill` row lives on the Host plane; the preset
+    // group provides the task-world provider inside the Agent's realm.
+    { id: 'skill', name: '@deepseek-ai/dsh-skill' },
     { id: 'local-fs', name: '@deepseek-ai/dsh-fs-local', config: { cwd: host } },
     { id: 'local-process', name: '@deepseek-ai/dsh-subprocess-local' },
     { id: 'local-shell', name: '@deepseek-ai/dsh-bash-local', config: { cwd: host } },
@@ -142,8 +152,38 @@ it.skipIf(process.platform === 'win32')('keeps Host I/O local and routes task to
   expect(JSON.stringify(result)).toContain('Task input belongs to the benchmark')
   expect(calls.length).toBeGreaterThan(0)
   expect(calls.every(path => path === '/jobs/by-session/task-owner/exec')).toBe(true)
+
+  // The deployed preset's own task-context rows read through the Agent-scoped
+  // filesystem: a rule file and a skill written only in the task world resolve
+  // through the remote provider, not through this process.
+  const taskRule = 'Composed evaluation task rule.\n'
+  await writeFile(join(task, 'AGENTS.md'), taskRule)
+  await mkdir(join(task, '.agents/skills/task-preset-skill'), { recursive: true })
+  await writeFile(join(task, '.agents/skills/task-preset-skill/SKILL.md'),
+    '---\nname: task-preset-skill\ndescription: Task preset skill\n---\n\nSkill body.\n')
+  const instructionText = await (async (): Promise<string> => {
+    const decision = await agentEvents(ctx, handle.agent).waterfall(
+      'agent/pre-step',
+      { messages: [], turn: 1, step: 2, signal: new AbortController().signal },
+      async () => ({ kind: 'enter' as const, messages: [] }),
+    )
+    const messages = decision.kind === 'enter' ? decision.messages : []
+    const message = messages.find((candidate: UserMessage): boolean =>
+      candidate.source.kind === 'agent-instructions')
+    return message?.content.map(block => block.type === 'text' ? block.text : '').join('') ?? ''
+  })()
+  expect(instructionText).toContain('Composed evaluation task rule.')
+  // The viewing scope is the Agent: the preset's own provider layer (and with
+  // it the task-world roots) is only visible to a lookup made for that Agent.
+  const catalog = await handle.agent.ctx.get('skills')!.snapshot({
+    cwd: task, agentId: 'task-owner', scope: handle.agent,
+  })
+  expect(catalog.skills.map(skill => skill.name)).toContain('task-preset-skill')
+
+  // Every read the task rows made carried the Agent identity, so none of them
+  // could have reached a Host path through this process.
   const before = calls.length
   const localTarget = await ctx.fs.resolve(join(host, 'host.txt'))
   expect(await ctx.fs.readText(localTarget)).toBe('Host state stays local\n')
-  expect(calls).toHaveLength(before)
+  expect(calls.slice(before)).toEqual([])
 })

@@ -153,19 +153,35 @@ describe('Continuum automatic admission', () => {
     await Promise.resolve()
     const admitted = h.agent.session.snapshotEvents().filter(event => event.type === 'continuum/memory-record')
     expect(admitted).toHaveLength(1)
-    expect(admitted[0]?.data).toEqual({ operation: 'create', record })
+    // The record stays byte-identical; the write trigger and attempt ride alongside it.
+    expect(admitted[0]?.data).toMatchObject({ operation: 'create', record, origin: 'explicit' })
+    expect(admitted[0]?.data).toEqual(expect.objectContaining({
+      operation: 'create', record,
+      writeId: expect.any(String) as unknown as string,
+      attemptId: expect.any(String) as unknown as string,
+    }))
   })
 
   it('retains input and reports a Session append failure during automatic admission', async () => {
     const h = await harness()
     const warn = vi.spyOn(h.ctx.logger, 'warn').mockImplementation(() => undefined)
     const source = h.agent.session.append('user/message', user('This input must survive an admission failure.'), { surfaceOp: 'append' })
-    const append = vi.spyOn(h.agent.session, 'append').mockImplementationOnce(() => { throw new Error('Session append unavailable') })
+    const original = h.agent.session.append.bind(h.agent.session)
+    const append = vi.spyOn(h.agent.session, 'append').mockImplementation(((type: string, ...rest: unknown[]) => {
+      // Only the authoritative record event fails; the contained observation events still reach the log.
+      if (type === 'continuum/memory-record') throw new Error('Session append unavailable')
+      return (original as unknown as (type: string, ...rest: unknown[]) => unknown)(type, ...rest)
+    }) as never)
     await Promise.resolve()
     expect(append).toHaveBeenCalledWith('continuum/memory-record', expect.any(Object))
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('continuum memory admission failed: Error: Session append unavailable'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('continuum memory record event was not recorded: Session append unavailable'))
     expect(h.agent.session.snapshotEvents()).toContainEqual(source)
     expect(h.agent.session.snapshotEvents().some(event => event.type === 'continuum/memory-record')).toBe(false)
+    // The failed attempt is still settled: a candidate that never reached the log is not reported as accepted.
+    const result = h.agent.session.snapshotEvents().find(event => event.type === 'continuum/memory-write-result')
+    expect(result?.type === 'continuum/memory-write-result' ? result.data.candidateResults : []).toEqual([
+      expect.objectContaining({ status: 'failed', reason: 'record-append-rejected' }),
+    ])
   })
 
   it('keeps explicit mode from admitting user input', async () => {

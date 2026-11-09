@@ -70,6 +70,14 @@ class _Run:
     # How many events this run has reported, which is the source sequence the
     # evaluator de-dupes and orders by.
     reported: int = 0
+    # One request-view decision per (source session, dispatch seq): the
+    # runtime's view, or None when it could not be produced. Seqs are per
+    # session, so the session is part of the key. A retry repeats the recorded
+    # decision instead of asking again, so a delivered report never changes.
+    request_views: dict[tuple[str, int], dict[str, Any] | None] = field(default_factory=dict)
+    # The harness whose client answers request views for this run. Set when the
+    # run starts; the sender thread uses it, never the notification callback.
+    view_source: Any = None
     # Reports the evaluator did not accept, oldest first. They keep their
     # sequence numbers: the receiver writes a contiguous run only, so skipping
     # one would hold every event after it.
@@ -199,6 +207,106 @@ def _route_from_task(task: dict[str, Any]) -> dict[str, str]:
     return route
 
 
+def _dispatch_reference(body: dict[str, Any]) -> int | None:
+    """Return the dispatch seq a report is about, or None for other events.
+
+    Only the two dispatch events may carry a view. A settled record names the
+    dispatch it closed in its own data, so its view is that dispatch's, not a
+    view of the settled record's own sequence.
+    """
+    event = body.get("event")
+    if not isinstance(event, dict):
+        return None
+    event_type = event.get("type")
+    if event_type not in ("llm/dispatch", "llm/dispatch-settled"):
+        return None
+    if event_type == "llm/dispatch":
+        value = event.get("seq")
+    else:
+        data = event.get("data")
+        value = data.get("dispatchSeq") if isinstance(data, dict) else None
+    return value if type(value) is int else None
+
+
+def _finish_error(reason: str | None, events: Any) -> str:
+    """Name why a normal harness return is not a completed case.
+
+    The runtime ends a failed turn with ``error`` and still reports idle, so
+    the SDK returns a result instead of raising. The turn-end event carries the
+    structured failure; keep its code, status, and message so the published
+    error names the same cause the trace does.
+    """
+    for event in reversed(events or []):
+        if not isinstance(event, dict) or event.get("type") != "turn/end":
+            continue
+        data = event.get("data")
+        detail = data.get("reason") if isinstance(data, dict) else None
+        error = detail.get("error") if isinstance(detail, dict) else None
+        if not isinstance(error, dict):
+            break
+        facts = " ".join(
+            str(error[key]) for key in ("code", "status", "message") if error.get(key) not in (None, "")
+        )
+        return f"turn ended with {reason!r}" + (f": {facts}" if facts else "")
+    return f"turn ended with {reason!r}"
+
+
+def _max_tokens_as_success() -> bool:
+    """Read the deployment's mapping for a token-capped turn.
+
+    ``deploy/evaluation.patch.yml`` passes ``DSH_MAX_TOKENS_AS_SUCCESS`` to the
+    runtime and treats an unset value as ``true``; the service shares that
+    environment, so the root outcome follows the same switch.
+    """
+    raw = os.environ.get("DSH_MAX_TOKENS_AS_SUCCESS")
+    if raw is None or not raw.strip():
+        return True
+    try:
+        value = json.loads(raw)
+    except ValueError as error:
+        raise ValueError("DSH_MAX_TOKENS_AS_SUCCESS must be a JSON boolean") from error
+    if not isinstance(value, bool):
+        raise ValueError("DSH_MAX_TOKENS_AS_SUCCESS must be a JSON boolean")
+    return value
+
+
+def _status_for_finish(
+    reason: str | None, events: Any, max_tokens_as_success: bool,
+) -> tuple[str, str | None]:
+    """Map a finished turn's own reason to the run's published outcome.
+
+    ``completed`` is success; ``max-tokens`` follows the deployment switch.
+    Every other kind — ``error``, ``aborted``, ``blocked``, ``interrupted``,
+    ``forked``, or no turn end at all — is a failed case, never a score of
+    zero. Cancellation still owns ``cancelled`` in ``_finish_run``.
+    """
+    if reason == "completed":
+        return "succeeded", None
+    if reason == "max-tokens" and max_tokens_as_success:
+        return "succeeded", None
+    return "failed", _finish_error(reason, events)
+
+
+def _rewrite_pending_outcome(run: _Run, status: str) -> None:
+    """Correct queued drafts to the outcome a recovered run really produced.
+
+    A result report or final event the evaluator never received is still a
+    draft, so it must carry the recovered status. Anything already delivered
+    is history: its bytes stay exactly as the evaluator received them.
+    """
+    if isinstance(run.result_report, dict) and run.result_delivery != "delivered":
+        run.result_report["status"] = status
+        run.result_report["error"] = run.error
+    for queued in run.undelivered:
+        event = queued.get("event")
+        if queued.get("final") is not True or not isinstance(event, dict):
+            continue
+        data = event.get("data")
+        if isinstance(data, dict):
+            data["status"] = status
+            data["error"] = run.error
+
+
 def _refuse_when_cancelled(run: _Run) -> Callable[[], None]:
     """Build the delivery-point check for one run's prompt."""
 
@@ -258,6 +366,9 @@ class HarnessService:
         self._retry_delay = float(os.environ.get("DSH_DELIVERY_RETRY_DELAY_SEC", "0.1"))
         self._event_timeout = float(os.environ.get("DSH_EVENT_TIMEOUT_SEC", "5"))
         self._result_timeout = float(os.environ.get("DSH_CALLBACK_TIMEOUT_SEC", "10"))
+        # The runtime's own mapping for a token-capped turn; read once here so
+        # a malformed value fails at start rather than at the first outcome.
+        self._max_tokens_as_success = _max_tokens_as_success()
         if (
             self._delivery_attempts < 1 or self._delivery_recovery_attempts < 0
             or not math.isfinite(self._retry_delay) or self._retry_delay < 0
@@ -292,6 +403,12 @@ class HarnessService:
                 "reports_closed": run.reports_closed, "event_delivery": run.event_delivery,
                 "result_delivery": run.result_delivery, "result_report": run.result_report,
                 "result": run.result, "error": run.error,
+                # Each dispatch's decided view, including an explicit null:
+                # a restart must repeat the decision instead of asking again.
+                "request_views": [
+                    {"source_session_id": session_id, "dispatch_seq": dispatch, "view": view}
+                    for (session_id, dispatch), view in sorted(run.request_views.items())
+                ],
                 "cancel_state": run.cancel_state, "terminal_status": run.terminal_status,
                 "done": run.done.is_set(),
             }
@@ -331,6 +448,16 @@ class HarnessService:
                 result=data["result"], error=data["error"], cancel_state=data["cancel_state"],
                 terminal_status=data.get("terminal_status"),
             )
+            for decision in data.get("request_views") or []:
+                # Older states have no record; the outbox body still carries
+                # whatever its first attempt sent, which the sender reuses.
+                if not isinstance(decision, dict):
+                    continue
+                session_id = decision.get("source_session_id")
+                dispatch = decision.get("dispatch_seq")
+                if isinstance(session_id, str) and type(dispatch) is int:
+                    view = decision.get("view")
+                    run.request_views[(session_id, dispatch)] = view if isinstance(view, dict) else None
             if isinstance(run.result_report, dict):
                 # A report persisted before callbacks stopped repeating the
                 # event history is still oversized; compact the outbound copy.
@@ -338,6 +465,23 @@ class HarnessService:
             if not data["done"]:
                 run.error = "execution state unknown after service restart; task was not rerun"
                 run.terminal_status = "failed"
+            elif (
+                run.terminal_status is not None
+                and run.cancel_state not in ("cancelling", "cancelled")
+                and isinstance(run.result, dict)
+            ):
+                # A state written before the outcome followed the turn's own
+                # reason may claim the wrong status, and an earlier build may
+                # have corrected the run without its queued drafts. Re-read the
+                # persisted result; the evidence stays exactly as recorded.
+                settled, reason_error = _status_for_finish(
+                    run.result.get("finish_reason"), run.result.get("events"),
+                    self._max_tokens_as_success,
+                )
+                if settled != "succeeded":
+                    run.terminal_status = settled
+                    run.error = run.error or reason_error
+                    _rewrite_pending_outcome(run, settled)
             run.done.set()
             run.worker_done.set()
             self._runs[run.run_id] = run
@@ -500,6 +644,7 @@ class HarnessService:
                 harness = self._ensure_started(route)
                 if run.cancel_requested:
                     return
+                run.view_source = harness
                 deliver = {"session_id": run.session_id, "before_deliver": _refuse_when_cancelled(run)}
                 if run.cwd:
                     deliver["cwd"] = run.cwd
@@ -524,6 +669,10 @@ class HarnessService:
                 status = "failed"
                 error_message = f"{type(error).__name__}: {error}"
             finally:
+                if completed is not None and status == "succeeded":
+                    status, error_message = _status_for_finish(
+                        result.finish_reason, result.events, self._max_tokens_as_success,
+                    )
                 run.worker_done.set()
                 self._finish_run(run, status, completed, error_message)
 
@@ -541,9 +690,12 @@ class HarnessService:
                 status = "cancelled"
             elif run.cancel_state == "cancel-failed":
                 status = "failed"
-            if status == "succeeded":
+            # A finished turn's result is kept whatever its outcome: a failed
+            # turn still carries the events and notifications that explain it,
+            # and the callback must not be left with only an error string.
+            if status in ("succeeded", "failed") and result is not None:
                 run.result = result
-            elif status == "cancelled":
+            if status == "cancelled":
                 run.cancel_state = "cancelled"
             run.error = run.error or (error if status == "failed" else None)
             run.terminal_status = status
@@ -626,6 +778,7 @@ class HarnessService:
                         run.event_delivery = "delivered"
                         return
                     report = run.undelivered[0]
+                self._attach_request_view(run, report)
                 sent = self._send_report(self._event_callback, run.event_url, report, self._event_timeout, run)
                 with run.delivery_condition:
                     if sent:
@@ -644,6 +797,45 @@ class HarnessService:
             with run.delivery_condition:
                 if run.event_sender is threading.current_thread():
                     run.event_sender = None
+
+    def _attach_request_view(self, run: _Run, body: dict[str, Any]) -> None:
+        """Put the runtime's own request view on a dispatch report, or name the gap.
+
+        Runs on the event sender thread, the only place an RPC to the runtime
+        may run. The decision is recorded per dispatch and reused by later
+        sends of the same report: a retry must repeat what the first attempt
+        carried instead of turning a missing view into a different body.
+        """
+        dispatch = _dispatch_reference(body)
+        if dispatch is None:
+            return
+        key = (body["source_session_id"], dispatch)
+        if key in run.request_views:
+            view = run.request_views[key]
+        else:
+            persisted = body.get("request_view")
+            if isinstance(persisted, dict):
+                # A report recovered from the outbox already carries the view
+                # its first attempt had; repeat it rather than fetch again.
+                run.request_views[key] = persisted
+                return
+            view = None
+            source = run.view_source
+            try:
+                if source is not None:
+                    view = source.request_view(key[0], dispatch)
+            except Exception as error:  # noqa: BLE001 - the source event survives without a view
+                run.delivery_error = (
+                    f"request_view unavailable for dispatch {dispatch} of "
+                    f"{key[0]}: {type(error).__name__}: {error}"
+                )
+            run.request_views[key] = view
+        if view is not None:
+            body["request_view"] = view
+        elif run.delivery_error is None:
+            run.delivery_error = f"request_view unavailable for dispatch {dispatch} of {key[0]}"
+        with run.delivery_condition:
+            self._save_delivery(run)
 
     def _send_report(
         self, callback: Any, url: str, body: dict[str, Any], timeout: float, run: _Run,
@@ -772,7 +964,7 @@ class HarnessService:
         elif run.cancel_state == "cancelled":
             state = {"run_id": run.run_id, "status": "cancelled"}
         elif run.error is not None:
-            state = {"run_id": run.run_id, "status": "failed", "error": run.error}
+            state = {"run_id": run.run_id, "status": "failed", "error": run.error, **(run.result or {})}
         else:
             state = {"run_id": run.run_id, "status": "completed", **(run.result or {})}
         if run.event_url or run.callback_url:

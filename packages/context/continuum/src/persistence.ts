@@ -1,4 +1,4 @@
-import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { MemoryId, MemoryRecord, MemoryRecordStore, MemorySourceRef, MemoryStatus, NewMemoryRecord } from './records.ts'
@@ -29,6 +29,12 @@ export interface MemoryRecordEventData {
   readonly previous?: MemoryRecordPredecessor
   /** Present when the transition invalidated in-flight reads; absent for create and on historical events. */
   readonly invalidatesReads?: true
+  /** The write trigger this transition belongs to; absent on historical events and on caller-owned transitions. */
+  readonly writeId?: string
+  /** The single create attempt that produced this record; absent on historical events and on non-create transitions. */
+  readonly attemptId?: string
+  /** Which entry produced the transition; absent on historical events. */
+  readonly origin?: MemoryWriteOrigin
 }
 
 /** One exact event resolved from a source reference. */
@@ -61,6 +67,12 @@ export interface MemoryIndexEventData {
   readonly entry: MemoryIndexEntry
   /** Admission path that produced the entry; absent on historical events. */
   readonly admission?: MemoryIndexAdmission
+  /** The write trigger this entry belongs to; absent on historical events. */
+  readonly writeId?: string
+  /** The single create attempt whose record this entry indexes; absent on historical events. */
+  readonly attemptId?: string
+  /** Which entry produced the L1 entry; absent on historical events. */
+  readonly origin?: MemoryWriteOrigin
 }
 
 /** Effective retrieval limits applied before any candidate reached the model. */
@@ -98,7 +110,240 @@ export interface MemoryRetrievalEventData {
   readonly matchedRecords: number
   /** Whether an optional selector receives the candidate pool after this read. */
   readonly selectorMounted: boolean
+  /** Stable identifier of the pre-step recall this read belongs to; absent on historical events. */
+  readonly recallId?: string
+  /** What the query composer consulted and settled on; written here when this event exists. */
+  readonly queryFacts?: MemoryQueryFacts
+  /** Complete retrieval participation and channel facts; absent on historical events. */
+  readonly retrievalFacts?: MemoryRetrievalFacts
+  /** Which candidates the pre-step request already contained; absent when filtering did not run. */
+  readonly filterFacts?: MemoryFilterFacts
 }
+
+/** One message the query composer inspected, identified by its native message id. */
+export interface MemoryQueryMessageFact {
+  readonly messageId: string
+  readonly role: string
+  /** Source kind the message carries; absent when the message has none, which never supplies a human query. */
+  readonly sourceKind?: string
+  /** Text the composer extracted from this message; empty when it carries no text block. */
+  readonly text: string
+}
+
+/** Which source the composer actually consulted, and whether it supplied the query. */
+export type MemoryQuerySourceLocation = 'pre_step_messages' | 'session_surface' | 'goal_projection'
+
+/** One source position the composer considered, in priority order. */
+export interface MemoryQuerySourceCheck {
+  /** `surface_execution_text` is the surface's assistant or tool text, consulted after the goal. */
+  readonly location: MemoryQuerySourceLocation | 'surface_execution_text'
+  readonly result: 'selected' | 'empty' | 'absent' | 'not_consulted'
+}
+
+/** The fixed lookup order and text rule this code version executes; not a tunable policy. */
+export interface MemoryQueryLookupPolicy {
+  readonly sourcePriority: readonly string[]
+  readonly textRule: string
+}
+
+/** Memory-query facts: which sources this read consulted and what query it settled on. */
+export interface MemoryQueryFacts {
+  readonly status: 'resolved' | 'no_query'
+  /** Complete query text; absent when no source produced one. */
+  readonly queryText?: string
+  readonly origin?: MemoryRecallQuerySource
+  readonly sourceLocation?: MemoryQuerySourceLocation
+  readonly lookupPolicy: MemoryQueryLookupPolicy
+  /** Request messages inspected, in the order the composer scanned them. */
+  readonly requestMessages: readonly MemoryQueryMessageFact[]
+  /** Session messages inspected from the current surface, in scan order. */
+  readonly surfaceMessages: readonly MemoryQueryMessageFact[]
+  /** Goal objective the composer actually read, when it reached that branch. */
+  readonly goalObjective?: string
+  /** The message or projection position that supplied the query. */
+  readonly selectedSource?: { readonly messageId: string } | { readonly location: 'goal_projection' }
+  readonly sourceChecks: readonly MemoryQuerySourceCheck[]
+  /** UTF-16 length of the query text. */
+  readonly lengthUtf16?: number
+  /** Epoch milliseconds when composition started and settled. */
+  readonly startedAt?: number
+  readonly endedAt?: number
+}
+
+/** Versioned record identity; the record event reference is present only when it was resolved. */
+export interface MemoryRecordRefFact {
+  readonly recordId: string
+  readonly revision: number
+  readonly recordSessionId?: string
+  readonly recordEventSeq?: number
+}
+
+/** One candidate the read produced, with its exact excerpt window inside the record content. */
+export interface MemoryRetrievalCandidateFact {
+  readonly record: MemoryRecordRefFact
+  readonly score: number
+  readonly excerptStart: number
+  readonly excerptEnd: number
+}
+
+/** One record that took part in lexical scoring, with the matched query terms. */
+export interface MemoryParticipantFact {
+  readonly record: MemoryRecordRefFact
+  readonly score: number
+  readonly matchedTerms: readonly string[]
+}
+
+/** One retrieval channel that actually ran. */
+export interface MemoryRetrievalRouteFact {
+  readonly routeId: 'lexical'
+  readonly method: string
+  readonly query: string
+  readonly scopes?: readonly string[]
+  readonly index: 'disposable_lexical_index' | 'none'
+}
+
+/** The matching, pool, limit and ordering rules this read actually applied. */
+export interface MemoryRetrievalPolicyFact {
+  readonly matchRule: string
+  readonly candidatePool: 'lexical' | 'all'
+  readonly maxCandidates: number
+  readonly maxExcerptBytes: number
+  readonly maxTotalBytes: number
+  readonly orderRule: string
+}
+
+/** Retrieval facts: complete participants, surviving candidates, channels and exclusions. */
+export interface MemoryRetrievalFacts {
+  readonly status: 'completed'
+  readonly participants: readonly MemoryParticipantFact[]
+  readonly candidates: readonly MemoryRetrievalCandidateFact[]
+  readonly routes: readonly MemoryRetrievalRouteFact[]
+  readonly retrievalPolicy: MemoryRetrievalPolicyFact
+  readonly excluded: readonly { readonly recordId: string; readonly reason: MemoryDropReasonFact }[]
+  readonly handoff: readonly MemoryRecordRefFact[]
+  readonly coverage: MemoryFactCoverage
+  readonly startedAt?: number
+  readonly endedAt?: number
+}
+
+/** Why one record did not survive a stage; the runtime drop reasons plus the index prefilter. */
+export type MemoryDropReasonFact = 'candidate-limit' | 'byte-budget' | 'excerpt-budget' | 'no-query-match' | 'index-prefilter'
+
+/** One compared candidate, identified by version and the pre-step message that contains it. */
+export interface MemoryFilterCandidateFact {
+  readonly record: MemoryRecordRefFact
+  readonly inputRank: number
+  readonly excerptStart: number
+  readonly excerptEnd: number
+}
+
+/** One pre-step message the freshness filter compared against. */
+export interface MemoryFilterMessageFact {
+  readonly messageId: string
+  readonly role: string
+  /** Source kind the message carries; absent when the message has none. */
+  readonly sourceKind?: string
+  readonly content: readonly ContentBlock[]
+}
+
+/** Comparison rule the filter executed; not a tunable policy. */
+export interface MemoryFilterRuleFact {
+  readonly textBlocksOnly: true
+  readonly joinSeparator: '\n'
+  readonly trimMessageText: true
+  readonly caseSensitive: true
+  readonly match: 'full_record_substring'
+}
+
+/** Filter facts: which candidates the pre-step request already contained, and which message proved it. */
+export interface MemoryFilterFacts {
+  readonly status: 'completed'
+  readonly comparisonScope: 'pre_step_messages'
+  readonly candidates: readonly MemoryFilterCandidateFact[]
+  readonly comparisonMessages: readonly MemoryFilterMessageFact[]
+  readonly kept: readonly { readonly record: MemoryRecordRefFact; readonly inputRank: number; readonly outputRank: number }[]
+  readonly excluded: readonly {
+    readonly record: MemoryRecordRefFact
+    readonly inputRank: number
+    readonly reason: 'already_in_pre_step_messages'
+    readonly matchedMessageId: string
+  }[]
+  readonly comparisonRule: MemoryFilterRuleFact
+  readonly alreadyPresentCount: number
+  readonly coverage: MemoryFactCoverage
+  readonly startedAt?: number
+  readonly endedAt?: number
+}
+
+/** Completeness of one stage's source facts; a missing member names the absent evidence. */
+export interface MemoryFactCoverage {
+  readonly complete: boolean
+  readonly missingEvidence: readonly string[]
+}
+
+/** Selector receipt this consumer applied; verbatim values from the settled result. */
+export interface MemorySelectorResultFact {
+  readonly mode: 'off' | 'shadow' | 'active'
+  readonly selectedIds: readonly string[]
+  readonly baselineIds: readonly string[]
+  readonly outcome: 'off' | 'baseline' | 'jev' | 'unknown'
+  readonly failure?: string
+}
+
+/** One selector id that repeated an earlier id in the same array; indices are zero-based. */
+export interface MemorySelectionDuplicateFact {
+  readonly recordId: string
+  readonly selectedInputIndex: number
+  readonly retainedInputIndex: number
+}
+
+/** One selector id that named no eligible candidate; it was ignored, not turned into a record version. */
+export interface MemorySelectionInvalidFact {
+  readonly recordId: string
+  readonly selectedInputIndex: number
+  readonly reason: 'outside_fresh_candidates'
+}
+
+/** One candidate that survived into the rendered recall, at its applied rank. */
+export interface MemorySelectedCandidateFact {
+  readonly record: MemoryRecordRefFact
+  readonly finalRank: number
+  readonly excerptStart: number
+  readonly excerptEnd: number
+}
+
+/** Selection facts: the path taken, what was applied, and every exclusion with its cause. */
+export interface MemorySelectionFacts {
+  readonly selectionPath: 'controller_with_selector' | 'controller_without_selector' | 'direct_store'
+  readonly maxTotalBytes?: number
+  readonly eligible: readonly {
+    readonly record: MemoryRecordRefFact
+    readonly inputRank: number
+    readonly excerptStart: number
+    readonly excerptEnd: number
+    readonly score: number
+  }[]
+  readonly selectorResult?: MemorySelectorResultFact
+  readonly appliedOrder: readonly { readonly record: MemoryRecordRefFact; readonly appliedRank: number }[]
+  readonly duplicateSelections: readonly MemorySelectionDuplicateFact[]
+  readonly invalidSelections: readonly MemorySelectionInvalidFact[]
+  readonly selected: readonly MemorySelectedCandidateFact[]
+  readonly excluded: readonly {
+    readonly recordId: string
+    readonly inputRank?: number
+    readonly reason: MemoryDropReasonFact | 'selection-duplicate' | 'selection-unknown-id'
+  }[]
+  readonly appliedSource?: 'jev' | 'baseline' | 'off'
+  /** This version has no independent final Top-K step, so it never reports one. */
+  readonly topKApplied: false
+  readonly actualSelectedCount: number
+  /** UTF-8 bytes of the complete rendered recall, including heading, metadata and separators. */
+  readonly renderedBytes: number
+  readonly coverage: MemoryFactCoverage
+  readonly startedAt?: number
+  readonly endedAt?: number
+}
+
 
 /** One ranked candidate with its lexical score and the query terms it matched. */
 export interface MemoryScoredCandidate {
@@ -150,6 +395,8 @@ export interface MemoryInjectedEventData {
   readonly bytes: number
   /** Selector outcome; absent on the deterministic path. */
   readonly selection?: MemorySelectionRecord
+  /** Stable identifier of the pre-step recall that produced this injection; absent on historical events. */
+  readonly recallId?: string
 }
 
 /** Where one recall query came from: the request's newest user message, the Session goal, or executed text. */
@@ -194,6 +441,127 @@ export interface MemoryRecallDecisionEventData {
   readonly injectedRecords?: number
   /** Records dropped because the current request already contained their text verbatim. */
   readonly alreadyPresentRecords?: number
+  /** Stable identifier of this pre-step recall; absent on historical events. */
+  readonly recallId?: string
+  /** Query facts, written here only when no `continuum/memory-retrieval` event carries them. */
+  readonly queryFacts?: MemoryQueryFacts
+  /** Selection facts for this recall; present when a selection path actually ran. */
+  readonly selectionFacts?: MemorySelectionFacts
+  /** Native id of the recall `user/message` this judgement appended; absent when none was created. */
+  readonly resultMessageId?: string
+}
+
+/** Which entry produced one memory write trigger. */
+export type MemoryWriteOrigin = 'explicit' | 'user-message' | 'compaction' | 'execution'
+
+/** One candidate an automatic entry actually offered for storage, before any judge ran. */
+export interface MemoryWriteCandidateFact {
+  readonly candidateId: string
+  /** Source events whose text supplied the candidate. */
+  readonly sourceRefs: readonly MemorySourceRef[]
+  /** Normalization this entry applied; `sourceChars` and `candidateChars` are both UTF-16 lengths. */
+  readonly normalization: {
+    readonly textBlocksOnly: boolean
+    readonly joinSeparator: '\n'
+    readonly trim: boolean
+    readonly sourceChars: number
+    readonly candidateChars: number
+    readonly truncated: boolean
+  }
+  /** Record id this candidate would create, when the entry derives one before the judge runs. */
+  readonly targetRecordId?: string
+}
+
+/** How completely one write entry's source window and candidate list were captured. */
+export interface MemoryWriteCoverage {
+  readonly sourceWindowComplete: boolean
+  readonly candidateListComplete: boolean
+  readonly missingEvidence: readonly string[]
+}
+
+/** One source the entry inspected and did not offer, with the reason it gave. */
+export interface MemoryWriteExclusionFact {
+  readonly sourceRefs: readonly MemorySourceRef[]
+  readonly reason: 'empty-text' | 'not-human-text' | 'existing-record' | 'interrupted' | 'candidate-limit' | 'out-of-window'
+}
+
+/** Event payload for the candidates one automatic write trigger actually offered. */
+export interface MemoryWriteCandidatesEventData {
+  readonly version: 1
+  readonly writeId: string
+  readonly origin: MemoryWriteOrigin
+  readonly status: 'candidates_ready' | 'skipped' | 'failed'
+  /** Why nothing was offered; absent when candidates were ready. */
+  readonly reason?: string
+  /** The Session event that triggered this write; absent when the caller itself is the trigger. */
+  readonly triggerRef?: MemoryWriteTriggerRef
+  /** The exact source window this entry scanned. */
+  readonly window?: MemoryWriteWindowFact
+  readonly candidates: readonly MemoryWriteCandidateFact[]
+  readonly exclusions: readonly MemoryWriteExclusionFact[]
+  /** Sources inside the window the entry stopped before inspecting. */
+  readonly unexaminedSourceRefs?: readonly MemorySourceRef[]
+  readonly coverage: MemoryWriteCoverage
+}
+
+/** One native event that triggered a memory write. */
+export interface MemoryWriteTriggerRef {
+  readonly sessionId: SessionId
+  readonly eventSeq: SessionSeq
+  readonly eventType: string
+}
+
+/** The source window one automatic entry scanned. */
+export type MemoryWriteWindowFact =
+  | { readonly kind: 'user-message'; readonly messageSeq: SessionSeq }
+  | { readonly kind: 'compaction'; readonly summarySeq: SessionSeq; readonly shadowedSeqs: readonly SessionSeq[] }
+  | { readonly kind: 'execution'; readonly stepStartSeq: SessionSeq; readonly stepEndSeq: SessionSeq }
+
+/** What happened to one offered candidate. */
+export type MemoryCandidateResultStatus =
+  | 'not_offered' | 'rejected' | 'already_exists' | 'not_attempted' | 'create_attempted' | 'record_accepted' | 'failed' | 'cancelled' | 'unverifiable'
+
+/** One candidate's real destination, with the record version it produced when one exists. */
+export interface MemoryCandidateResultFact {
+  readonly candidateId: string
+  readonly status: MemoryCandidateResultStatus
+  readonly reason?: string
+  readonly record?: MemoryRecordRefFact
+  readonly attemptId?: string
+}
+
+/** How far one create attempt got; each stage is reported separately because they are not atomic. */
+export interface MemoryAttemptResultFact {
+  readonly attemptId: string
+  readonly proposedRecordId: string
+  readonly candidateId?: string
+  readonly origin: MemoryWriteOrigin
+  readonly storeStatus: 'created' | 'rejected' | 'unknown'
+  readonly appendStatus: 'accepted' | 'rejected' | 'unverifiable'
+  readonly indexStatus: 'observed' | 'not_attempted' | 'unverifiable'
+  readonly l1Status: 'added' | 'not_applicable' | 'failed' | 'unverifiable'
+  readonly recordEventRef?: { readonly sessionId: SessionId; readonly seq: SessionSeq }
+  readonly failure?: { readonly stage: 'store' | 'append' | 'index'; readonly code?: string; readonly message?: string }
+}
+
+/** Event payload for the real destination of every candidate one write trigger offered. */
+export interface MemoryWriteResultEventData {
+  readonly version: 1
+  readonly writeId: string
+  readonly origin: MemoryWriteOrigin
+  readonly triggerRef?: MemoryWriteTriggerRef
+  readonly candidateResults: readonly MemoryCandidateResultFact[]
+  readonly attemptResults: readonly MemoryAttemptResultFact[]
+  /** Accepted `continuum/memory-record` creates this trigger produced. */
+  readonly recordEventRefs: readonly { readonly sessionId: SessionId; readonly seq: SessionSeq }[]
+  /** L1 and lexical index events this trigger produced. */
+  readonly indexEventRefs: readonly { readonly sessionId: SessionId; readonly seq: SessionSeq; readonly kind: 'l1' | 'lexical' }[]
+  /** The execution write decision this result settles; absent for other entries. */
+  readonly nativeWriteDecisionRef?: { readonly sessionId: SessionId; readonly seq: SessionSeq }
+  /** Values the native decision reported, kept beside the observed ones so a conflict stays visible. */
+  readonly reportedCounts?: { readonly candidateRecords: number; readonly writtenRecords?: number }
+  readonly partialFailures: readonly string[]
+  readonly missingEvidence: readonly string[]
 }
 
 /** Maximum UTF-16 characters of a query or term recorded in a retrieval event. */
@@ -259,6 +627,10 @@ declare module '@deepseek-ai/dsh-session/types' {
     'continuum/memory-index-rebuilt': MemoryIndexRebuiltEventData
     /** A newer record snapshot queued for the next bounded index rebuild; log-only and never model-visible. */
     'continuum/memory-index-queued': MemoryIndexQueuedEventData
+    /** The candidates one automatic memory write trigger actually offered; log-only and never model-visible. */
+    'continuum/memory-write-candidates': MemoryWriteCandidatesEventData
+    /** The real destination of every candidate one memory write trigger offered; log-only and never model-visible. */
+    'continuum/memory-write-result': MemoryWriteResultEventData
   }
 }
 
@@ -277,6 +649,15 @@ export interface MemoryIndexRebuiltEventData {
   readonly pendingRecords: number
   /** How many queued snapshots this rebuild consumed; absent on a full rebuild. */
   readonly consumed?: number
+  /**
+   * Records this rebuild actually applied: the cold-start snapshot members for `full`, or the entries the bounded
+   * loop drained. The count alone cannot say which version reached the index.
+   */
+  readonly appliedRecords?: readonly { readonly recordId: MemoryId; readonly revision: number }[]
+  /** Epoch milliseconds when the rebuild work itself started; absent on historical events. */
+  readonly startedAt?: number
+  /** Epoch milliseconds when the rebuild work finished; absent on historical events. */
+  readonly endedAt?: number
 }
 
 /** Event payload for one record snapshot queued into the derived index. */
@@ -284,6 +665,10 @@ export interface MemoryIndexQueuedEventData {
   readonly recordId: MemoryId
   /** Queue depth after this enqueue, before the bounded rebuild drains it. */
   readonly pendingRecords: number
+  /** Version of the snapshot this enqueue replaced in the queue; absent on historical events. */
+  readonly revision?: number
+  /** The write trigger that produced the queued snapshot; absent on historical events. */
+  readonly writeId?: string
 }
 
 /**
@@ -308,6 +693,7 @@ export function memorySourceText(event: SessionEvent): string {
  * @param result - counts the rebuild reported.
  * @param scope - whole projection or bounded drain of the queue.
  * @param consumed - queued snapshots this rebuild consumed; omit for a full rebuild.
+ * @param applied - the versions this rebuild really applied, with its real work interval.
  * @returns the appended event with its assigned sequence number.
  */
 export function appendMemoryIndexRebuiltEvent(
@@ -315,13 +701,26 @@ export function appendMemoryIndexRebuiltEvent(
   result: MemoryIndexRebuildResult,
   scope: 'full' | 'bounded',
   consumed?: number,
+  applied?: MemoryIndexRebuildEventDetails,
 ): SessionEvent<'continuum/memory-index-rebuilt'> {
   return session.append('continuum/memory-index-rebuilt', {
     scope,
     indexedRecords: result.indexedRecords,
     pendingRecords: result.pendingRecords,
     ...(consumed === undefined ? {} : { consumed }),
+    ...(applied === undefined ? {} : {
+      appliedRecords: applied.appliedRecords.map(entry => ({ recordId: entry.recordId, revision: entry.revision })),
+      startedAt: applied.startedAt,
+      endedAt: applied.endedAt,
+    }),
   })
+}
+
+/** Records one rebuild actually applied, with the real work interval. */
+export interface MemoryIndexRebuildEventDetails {
+  readonly appliedRecords: readonly { readonly recordId: MemoryId; readonly revision: number }[]
+  readonly startedAt: number
+  readonly endedAt: number
 }
 
 /**
@@ -329,14 +728,20 @@ export function appendMemoryIndexRebuiltEvent(
  * @param session - live Session that owns the durable event log.
  * @param recordId - record whose newer snapshot was queued.
  * @param pendingRecords - queue depth after the enqueue.
+ * @param details - the queued snapshot's version and, when known, its write trigger.
  * @returns the appended event with its assigned sequence number.
  */
 export function appendMemoryIndexQueuedEvent(
   session: Session,
   recordId: MemoryId,
   pendingRecords: number,
+  details?: { readonly revision: number; readonly writeId?: string },
 ): SessionEvent<'continuum/memory-index-queued'> {
-  return session.append('continuum/memory-index-queued', { recordId, pendingRecords })
+  return session.append('continuum/memory-index-queued', {
+    recordId, pendingRecords,
+    ...(details === undefined ? {} : { revision: details.revision }),
+    ...(details?.writeId === undefined ? {} : { writeId: details.writeId }),
+  })
 }
 
 /**
@@ -377,20 +782,63 @@ export const MAX_EXECUTION_CANDIDATE_CHARS = 16_384
 export const MAX_EXECUTION_CANDIDATES = 32
 
 /**
+ * Append the candidates one automatic write trigger offered. A failed append is reported and never fails the write.
+ * @param session - live Session that owns the durable event log.
+ * @param facts - the offered candidates, exclusions and window.
+ * @param warn - warning sink for a contained append failure.
+ * @returns the appended event, or undefined when the append failed.
+ */
+export function appendMemoryWriteCandidatesEvent(
+  session: Session,
+  facts: MemoryWriteCandidatesEventData,
+  warn: (message: string) => void,
+): SessionEvent<'continuum/memory-write-candidates'> | undefined {
+  try {
+    return session.append('continuum/memory-write-candidates', facts)
+  } catch (error: unknown) {
+    warn(`continuum write candidates were not recorded: ${String(error)}`)
+    return undefined
+  }
+}
+
+/**
+ * Append the real destination of every candidate one write trigger offered. A failed append is reported and never
+ * fails the write itself.
+ * @param session - live Session that owns the durable event log.
+ * @param facts - per-candidate and per-attempt results with their record references.
+ * @param warn - warning sink for a contained append failure.
+ * @returns the appended event, or undefined when the append failed.
+ */
+export function appendMemoryWriteResultEvent(
+  session: Session,
+  facts: MemoryWriteResultEventData,
+  warn: (message: string) => void,
+): SessionEvent<'continuum/memory-write-result'> | undefined {
+  try {
+    return session.append('continuum/memory-write-result', facts)
+  } catch (error: unknown) {
+    warn(`continuum write result was not recorded: ${String(error)}`)
+    return undefined
+  }
+}
+
+/**
  * Append one execution-fact judgement to the Session log. A failed append is reported and never fails the step.
  * @param session - live Session that owns the durable event log.
  * @param decision - turn, step, terminal outcome and real counts.
  * @param warn - warning sink for a contained append failure.
+ * @returns the appended event, or undefined when the append failed.
  */
 export function appendMemoryWriteDecision(
   session: Session,
   decision: MemoryWriteDecisionEventData,
   warn: (message: string) => void,
-): void {
+): SessionEvent<'continuum/memory-write-decision'> | undefined {
   try {
-    session.append('continuum/memory-write-decision', decision)
+    return session.append('continuum/memory-write-decision', decision)
   } catch (error: unknown) {
     warn(`continuum memory write decision was not recorded: ${String(error)}`)
+    return undefined
   }
 }
 
@@ -399,14 +847,23 @@ export function appendMemoryWriteDecision(
  * @param session - live Session that owns the durable event log.
  * @param entry - entry whose source is a human message of the same Session.
  * @param admission - admission path and tag source; omit only when the caller owns that fact.
+ * @param attribution - the write trigger and attempt this entry belongs to.
  * @returns the appended event with its assigned sequence number.
  */
 export function appendMemoryIndexEvent(
   session: Session,
   entry: MemoryIndexEntry,
   admission?: MemoryIndexAdmission,
+  attribution?: MemoryWriteAttribution,
 ): SessionEvent<'continuum/memory-index'> {
-  return session.append('continuum/memory-index', { operation: 'add', entry, ...(admission === undefined ? {} : { admission }) })
+  return session.append('continuum/memory-index', {
+    operation: 'add', entry,
+    ...(admission === undefined ? {} : { admission }),
+    ...(attribution === undefined ? {} : {
+      writeId: attribution.writeId, origin: attribution.origin,
+      ...(attribution.attemptId === undefined ? {} : { attemptId: attribution.attemptId }),
+    }),
+  })
 }
 
 /**
@@ -415,6 +872,7 @@ export function appendMemoryIndexEvent(
  * @param operation - transition represented by the record snapshot.
  * @param record - post-transition record accepted by the caller's store.
  * @param previous - pre-transition record for supersede or deactivate; omit for create.
+ * @param attribution - the write trigger and attempt this transition belongs to.
  * @returns the appended event with its assigned sequence number.
  */
 export function appendMemoryRecordEvent(
@@ -422,12 +880,24 @@ export function appendMemoryRecordEvent(
   operation: MemoryRecordOperation,
   record: MemoryRecord,
   previous?: MemoryRecordPredecessor,
+  attribution?: MemoryWriteAttribution,
 ): SessionEvent<'continuum/memory-record'> {
   return session.append('continuum/memory-record', {
     operation, record,
     ...(previous === undefined ? {} : { previous }),
     ...(operation === 'create' ? {} : { invalidatesReads: true as const }),
+    ...(attribution === undefined ? {} : { writeId: attribution.writeId }),
+    ...(attribution?.attemptId === undefined ? {} : { attemptId: attribution.attemptId }),
+    ...(attribution === undefined ? {} : { origin: attribution.origin }),
   })
+}
+
+/** Which write trigger and attempt one record or index event belongs to. */
+export interface MemoryWriteAttribution {
+  readonly writeId: string
+  readonly origin: MemoryWriteOrigin
+  /** Present only on the single create attempt that produced the transition. */
+  readonly attemptId?: string
 }
 
 /**

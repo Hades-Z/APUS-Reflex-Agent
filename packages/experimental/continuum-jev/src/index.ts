@@ -59,6 +59,8 @@ export interface MemorySelectionRequest {
   readonly isCurrent?: () => boolean
   /** Caller-applied limits and admission mode; recorded in the evaluation when supplied. */
   readonly limits?: MemorySelectionLimits
+  /** Stable id of the pre-step recall this judgement serves; recorded on both receipt phases when supplied. */
+  readonly recallId?: string
 }
 
 /** Resolved settings for a bounded relevance batch; privacy admission precedes network dispatch. */
@@ -156,6 +158,8 @@ export interface ContinuumMemoryEvaluation {
   readonly policy?: ContinuumMemoryDecisionPolicy
   /** Caller-applied retrieval limits and admission mode; absent when the caller supplied none. */
   readonly limits?: MemorySelectionLimits
+  /** Stable id of the pre-step recall this evaluation belongs to; absent outside one. */
+  readonly recallId?: string
 }
 
 /** One tag-routing judgement: which L1 tags the input needs. */
@@ -188,6 +192,8 @@ export interface ContinuumMemoryDecisionReceipt {
   readonly confidence?: number
   readonly failure?: string
   readonly evaluation?: ContinuumMemoryEvaluation
+  /** Stable id of the pre-step recall this receipt belongs to; absent on historical and non-recall receipts. */
+  readonly recallId?: string
 }
 
 declare module '@deepseek-ai/dsh-session/types' {
@@ -249,6 +255,10 @@ export interface ContinuumMemoryAdmissionReceipt {
   readonly admittedTags: readonly (readonly string[])[]
   readonly outcome: 'off' | 'baseline' | 'jev' | 'unknown'
   readonly failure?: string
+  /** Which entry triggered this admission; absent on historical receipts and when the caller owns no entry. */
+  readonly origin?: 'compaction' | 'execution'
+  /** The write trigger this receipt belongs to; absent on historical receipts. */
+  readonly writeId?: string
   /** Null when no authorized, bounded request was prepared; prepared does not imply dispatched. */
   readonly request: JevRequest | null
   readonly response?: JevResponse
@@ -277,6 +287,8 @@ export interface MemoryAdmissionRequest {
   readonly isCurrent?: () => boolean
   /** What the quoted text is, for the model-facing question; omitted means a user message. */
   readonly subject?: 'user message' | 'executed output'
+  /** The write trigger these receipts belong to; recorded verbatim when supplied. */
+  readonly writeId?: string
 }
 
 /**
@@ -319,6 +331,7 @@ class ContinuumJevPlugin extends Service {
           isCurrent: () => active && input.isCurrent(),
           candidates: input.candidates.map(candidate => ({ ...candidate, id: MemoryId(candidate.id) })),
           ...(input.limits === undefined ? {} : { limits: input.limits }),
+          ...(input.recallId === undefined ? {} : { recallId: input.recallId }),
         }, signal, prepared => durable(recordContinuumMemoryDecision(agent.session, prepared)))
         signal.throwIfAborted()
         recordContinuumMemoryDecision(agent.session, result)
@@ -341,6 +354,7 @@ class ContinuumJevPlugin extends Service {
             const result = await admitContinuumMemory(ctx.get('jev'), config, {
               isCurrent: () => active && input.isCurrent(),
               candidates: batch.map(candidate => ({ id: MemoryId(candidate.id), content: candidate.content })),
+              ...(input.writeId === undefined ? {} : { writeId: input.writeId }),
             }, signal, prepared => durable(agent.session.append('continuum/memory-admission', { ...prepared, ...batchFacts })))
             signal.throwIfAborted()
             agent.session.append('continuum/memory-admission', { ...result, ...batchFacts })
@@ -358,15 +372,20 @@ class ContinuumJevPlugin extends Service {
           const durable = checkpoint(agent, signal)
           const admitted: ContinuumAdmittedMemory[] = []
           const size = admissionBatchSize(config)
+          let batchIndex = 0
           for (let start = 0; start < input.candidates.length; start += size) {
             const batch = input.candidates.slice(start, start + size)
+            // Execution batches carry the same position as compaction ones, so a mixed log needs no entry-specific guess.
+            const batchFacts = { batchIndex, batchSize: batch.length, batchTotal: input.candidates.length }
+            batchIndex += 1
             const result = await admitContinuumMemory(ctx.get('jev'), config, {
               isCurrent: () => active && input.isCurrent(),
               candidates: batch.map(candidate => ({ id: MemoryId(candidate.id), content: candidate.content })),
               subject: 'executed output',
-            }, signal, prepared => durable(agent.session.append('continuum/memory-admission', prepared)))
+              ...(input.writeId === undefined ? {} : { writeId: input.writeId }),
+            }, signal, prepared => durable(agent.session.append('continuum/memory-admission', { ...prepared, ...batchFacts })))
             signal.throwIfAborted()
-            agent.session.append('continuum/memory-admission', result)
+            agent.session.append('continuum/memory-admission', { ...result, ...batchFacts })
             if (result.reason !== 'judged') continue
             admitted.push(...result.admittedIds.map((id, index) => ({
               id: String(id), tags: result.admittedTags[index] as readonly string[],
@@ -499,7 +518,11 @@ export async function selectContinuumMemory(
     selection: config.selection ?? 'rank', minRelevance: config.minRelevance ?? 0.7,
     routeAbove: config.routeAbove ?? MAX_JEV_QUESTIONS, minRouteProbability: config.minRouteProbability ?? 0.5,
   }
-  const recorded = input.limits === undefined ? { policy } : { policy, limits: input.limits }
+  const recorded = {
+    policy,
+    ...(input.limits === undefined ? {} : { limits: input.limits }),
+    ...(input.recallId === undefined ? {} : { recallId: input.recallId }),
+  }
   const baseline = input.candidates.map(candidate => candidate.id)
   const matched = input.candidates.filter(candidate => !threshold || candidate.score > 0).map(candidate => candidate.id)
   let routing: ContinuumMemoryRouting | undefined
@@ -612,6 +635,11 @@ export async function admitContinuumMemory(
   if (input.candidates.length > size) throw new RangeError(`admission batches hold at most ${String(size)} candidates`)
   const tags = config.tags ?? DEFAULT_MEMORY_TAGS
   const candidateIds = input.candidates.map(candidate => candidate.id)
+  // The receipt must let a reader tell a compaction judgement from an execution one; the subject names it when known.
+  const attribution = {
+    ...(input.subject === undefined ? {} : { origin: input.subject === 'executed output' ? 'execution' as const : 'compaction' as const }),
+    ...(input.writeId === undefined ? {} : { writeId: input.writeId }),
+  }
   const fallback = (
     reason: ContinuumMemoryAdmissionReceipt['reason'], failure?: string, request: JevRequest | null = null, preparedSeq?: SessionSeq,
   ): ContinuumMemoryAdmissionReceipt => ({
@@ -622,7 +650,7 @@ export async function admitContinuumMemory(
       admittedIds: candidateIds, admittedTags: candidateIds.map(() => []),
     },
     outcome: reason === 'off' ? 'off' : reason === 'provider-unavailable' ? 'baseline' : 'unknown',
-    ...(failure === undefined ? {} : { failure }), request, reason,
+    ...(failure === undefined ? {} : { failure }), request, reason, ...attribution,
   })
   if (config.mode === 'off') return fallback('off')
   if (jev === undefined) return fallback('provider-unavailable')
@@ -653,7 +681,7 @@ export async function admitContinuumMemory(
   return {
     version: 1, mode: config.mode, phase: 'settled', ...(preparedSeq === undefined ? {} : { preparedSeq }), candidateIds,
     admittedIds: indexed.map(memory => memory.id), admittedTags: indexed.map(memory => memory.tags),
-    outcome: 'jev', request: batch.request, response: batch.response, reason: 'judged',
+    outcome: 'jev', request: batch.request, response: batch.response, reason: 'judged', ...attribution,
   }
 }
 
@@ -714,9 +742,12 @@ function tagInstructions(content: string, tag: ContinuumMemoryTag, subject = 'us
  * @returns appended receipt event.
  */
 export function recordContinuumMemoryDecision(session: Session, result: MemorySelectionResult): SessionEvent<'continuum/memory-decision'> {
+  const recallId = result.evaluation.recallId
   return session.append('continuum/memory-decision', {
-    version: 1, mode: result.mode, selectedIds: [...result.selectedIds], baselineIds: [...result.baselineIds], outcome: result.outcome,
+    version: 1, mode: result.mode, selectedIds: [...result.selectedIds], baselineIds: [...result.baselineIds],
+    outcome: result.outcome,
     ...(result.failure === undefined ? {} : { failure: result.failure }), evaluation: result.evaluation,
+    ...(recallId === undefined ? {} : { recallId }),
   })
 }
 

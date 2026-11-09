@@ -1,9 +1,12 @@
 /** Durable retrieval facts for one bounded memory read; log-only and never model-visible. */
 import type { Session } from '@deepseek-ai/dsh-session'
 import type {
+  MemoryFilterFacts,
   MemoryInjectedEventData,
+  MemoryQueryFacts,
   MemoryRecallDecisionEventData,
   MemoryRecallQuerySource,
+  MemoryRetrievalFacts,
   MemoryRetrievalLimits,
   MemorySelectionRecord,
 } from './persistence.ts'
@@ -24,6 +27,14 @@ export interface MemoryRetrievalTrace {
   readonly query: string
   /** Where the query came from. */
   readonly querySource: MemoryRecallQuerySource
+  /** Stable identifier of the pre-step recall this read belongs to. */
+  readonly recallId?: string
+  /** What the query composer consulted and settled on. */
+  readonly queryFacts?: MemoryQueryFacts
+  /** Complete retrieval participation, channels and exclusions. */
+  readonly retrievalFacts?: MemoryRetrievalFacts
+  /** Which candidates the pre-step request already contained. */
+  readonly filterFacts?: MemoryFilterFacts
   /** Exact authorized scopes; absent when the caller owns no scope list. */
   readonly scopes?: readonly string[]
   readonly limits: MemoryRetrievalLimits
@@ -79,6 +90,10 @@ export function recordMemoryRetrieval(recorder: MemoryRetrievalRecorder, trace: 
       terms: [...report.terms],
       matchedRecords: report.matchedRecords,
       selectorMounted: trace.selectorMounted,
+      ...(trace.recallId === undefined ? {} : { recallId: trace.recallId }),
+      ...(trace.queryFacts === undefined ? {} : { queryFacts: trace.queryFacts }),
+      ...(trace.retrievalFacts === undefined ? {} : { retrievalFacts: trace.retrievalFacts }),
+      ...(trace.filterFacts === undefined ? {} : { filterFacts: trace.filterFacts }),
     })
     if (report.ranked.length > 0) {
       recorder.session.append('continuum/memory-scored', {
@@ -108,6 +123,7 @@ export function recordMemoryRetrieval(recorder: MemoryRetrievalRecorder, trace: 
       injectedRecords: injection.workingSet.candidates.length,
       bytes: injection.workingSet.bytes,
       ...(injection.selection === undefined ? {} : { selection: injection.selection }),
+      ...(trace.recallId === undefined ? {} : { recallId: trace.recallId }),
     }
     recorder.session.append('continuum/memory-injected', injected)
   } catch (error: unknown) {

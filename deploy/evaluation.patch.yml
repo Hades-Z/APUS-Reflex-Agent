@@ -27,6 +27,11 @@
             contextWindow: !!js 'Number(process.env.LLM_CONTEXT_WINDOW || 1048576)'
             maxTokens: !!js 'Number(process.env.LLM_MAX_TOKENS || 8192)'
 
+- id: sdk-jsonrpc-server
+  config:
+    maxTokensAsSuccess: !!js 'process.env.DSH_MAX_TOKENS_AS_SUCCESS === undefined ? true : JSON.parse(process.env.DSH_MAX_TOKENS_AS_SUCCESS)'
+    recordLlmDispatch: true
+
 - insert:
     - id: agent-preset-registry
       name: /workspace/packages/preset/agent-preset-registry/lib/index.js
@@ -70,20 +75,16 @@
                   sampleOverCapGlobResults: false
               - id: tool-bash
                 name: '@deepseek-ai/dsh-tool-bash'
-
-    # Task rules and skills. Mounted outside the isolated tool group: the
-    # compose reads through the context's own filesystem provider, and inside
-    # the remote-isolated group the pre-step agent identity does not reach
-    # the remote resolve, which kills the turn before the model is called.
-    - id: agent-instructions
-      name: '@deepseek-ai/dsh-agent-instructions'
-      config:
-        instructionFileCandidates: ['AGENTS.md', 'CLAUDE.md']
-        maxBytes: 32768
-    - id: skill-filesystem
-      name: '@deepseek-ai/dsh-skill-filesystem'
-      config:
-        includeDefaultRoots: false
+              # Task context reads use the same Agent-scoped filesystem as tools.
+              - id: agent-instructions
+                name: '@deepseek-ai/dsh-agent-instructions'
+                config:
+                  instructionFileCandidates: ['AGENTS.md', 'CLAUDE.md']
+                  maxBytes: 32768
+              - id: skill-filesystem
+                name: '@deepseek-ai/dsh-skill-filesystem'
+                config:
+                  includeDefaultRoots: true
 
     # Jev decides; the harness records what it decided.
     - id: jev
@@ -123,7 +124,15 @@
         # Execution facts stay off unless the run explicitly opts in. `verified`
         # offers each closed step's assistant/tool text to the admitter, which
         # decides what becomes a record; the default writes no judgement.
-        executionAdmission: !!js 'process.env.CONTINUUM_EXECUTION_ADMISSION || "off"'
+        # Acceptance runs this profile with `verified`: the trace has to show
+        # what execution admission judged, not only user-message admission.
+        executionAdmission: !!js 'process.env.CONTINUUM_EXECUTION_ADMISSION || "verified"'
+        # Retrieval audit facts. The schema default is false, which drops every
+        # continuum/memory-retrieval record and with it the query, lexical
+        # candidate and filter facts the trace needs; the acceptance profile
+        # records them. This is a recording switch, not a budget or a model
+        # choice, and the shipped profile default stays false.
+        trace: true
 
     - id: continuum-jev
       name: /workspace/packages/experimental/continuum-jev/lib/index.js
