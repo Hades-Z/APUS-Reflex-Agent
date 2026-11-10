@@ -701,6 +701,10 @@ export default class ContinuumMemory extends Service implements ContinuumMemoryS
   /** Admit one committed human message when the protected automatic mode is enabled. */
   private admitUserMessage(session: Session, event: SessionEvent): void {
     if ((this.config.admission ?? 'explicit') !== 'user-message' || !this.state().enabled || event.type !== 'user/message') return
+    // Recall output and runtime context ride the user role but no person wrote
+    // them; admission only describes human input, so they get no candidate and
+    // no writeId of their own.
+    if (event.data.source.kind !== 'user') return
     const content = memorySourceText(event)
     const scope = this.config.scopes[0]
     const writeId = randomUUID()

@@ -104,6 +104,26 @@ describe('Continuum automatic admission', () => {
     expect(h.agent.session.snapshotEvents().some(event => event.type === 'continuum/memory-record')).toBe(false)
   })
 
+  it.each(['continuum-memory', 'runtime-context'] as const)(
+    'records no write candidates for a %s message that is not a human input',
+    async (kind) => {
+      // Recall output and runtime context ride the protocol's user role, but no
+      // person wrote them: calling them a human memory candidate produced one
+      // empty-text write per step, each with its own writeId.
+      const h = await harness()
+      const message = createUserMessage({
+        source: kind === 'continuum-memory'
+          ? { kind: 'continuum-memory', form: 'recall', version: 1, recordIds: ['existing'] }
+          : { kind: 'runtime-context' },
+        content: [{ type: 'text', text: 'Injected, not typed.' }],
+      })
+      h.agent.session.append('user/message', message, { surfaceOp: 'append' })
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(h.agent.session.snapshotEvents().some(event => event.type === 'continuum/memory-write-candidates')).toBe(false)
+    },
+  )
+
   it('leaves an agentless Session input unadmitted', async () => {
     const h = await harness()
     const warn = vi.spyOn(h.ctx.logger, 'warn').mockImplementation(() => undefined)

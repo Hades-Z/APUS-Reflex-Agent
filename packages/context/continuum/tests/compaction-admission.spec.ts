@@ -135,6 +135,26 @@ describe('Continuum compaction admission', () => {
     expect(recalled(h.adapter)).toEqual([])
   })
 
+  it('keeps writing compaction candidates for human text and none for injected user-role messages', async () => {
+    // The human-message entry ignores injected user-role messages; compaction
+    // must keep working, because it reads the shadowed originals itself.
+    const h = await harness({ admitter: keepAll })
+    await seed(h.agent)
+    h.agent.session.append('user/message', createUserMessage({
+      source: { kind: 'continuum-memory', form: 'recall', version: 1, recordIds: ['injected'] },
+      content: [{ type: 'text', text: 'Injected recall text that no person typed.' }],
+    }), { surfaceOp: 'append' })
+    await Promise.resolve()
+    expect(await h.compaction.compactNow(h.agent, SIGNAL)).not.toBeNull()
+    const candidates = h.agent.session.snapshotEvents().flatMap(event =>
+      event.type === 'continuum/memory-write-candidates' && event.data.origin === 'compaction' ? [event.data] : [])
+    expect(candidates).toHaveLength(1)
+    expect(candidates[0]?.status).toBe('candidates_ready')
+    const offered = candidates[0]?.candidates ?? []
+    expect(offered.length).toBeGreaterThan(0)
+    expect(offered.every(candidate => !candidate.candidateId.includes('injected'))).toBe(true)
+  })
+
   it('admits only the compacted human messages the admitter keeps, and the next read waits for them', async () => {
     const admit = vi.fn<ContinuumMemoryAdmitter['admit']>(async (_agent, input) => {
       await new Promise(resolve => setTimeout(resolve, 20))
