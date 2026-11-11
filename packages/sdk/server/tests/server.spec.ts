@@ -1573,13 +1573,61 @@ describe('HarnessSdkJsonRpcServer', () => {
       expect(flush).toBeDefined()
       expect((flush as { data: { sessionId: string; throughSeq: number } }).data.sessionId)
         .toBe('settled-idle')
-      expect((flush as { data: { throughSeq: number } }).data.throughSeq)
-        .toBeGreaterThanOrEqual((events.at(-1) as { seq: number }).seq - 1)
+      const reported = (flush as { data: { throughSeq: number } }).data.throughSeq
+      expect(reported).toBeGreaterThanOrEqual((events.at(-1) as { seq: number }).seq - 1)
+      // 覆盖范围必须真的在存储里：读回已落盘的日志，确认报告到的那一条确实存在，
+      // 且确认记录作为“落盘证据”本身也已被保存，而不是只在内存里。
+      const persistence = ctx.get('sessionPersistence')
+      if (persistence === undefined) throw new Error('this harness must mount session persistence')
+      const handle = await persistence.open(SessionId('settled-idle'), 'read')
+      try {
+        const stored = await handle.read(0)
+        const storedSeqs = new Set(stored.events.map(event => Number(event.seq)))
+        expect(storedSeqs.has(reported)).toBe(true)
+      } finally {
+        await handle.close()
+      }
       await server.shutdown()
     } finally {
       await ctx.fiber.dispose()
       await rm(storageDir, { recursive: true, force: true })
     }
+  })
+
+  it('does not record a flush when no durability listener participated', async () => {
+    const appended: string[] = []
+    const session = {
+      id: SessionId('no-listener'),
+      seq: 5,
+      append: vi.fn((type: string) => { appended.push(type); return {} }),
+    } as unknown as Agent['session']
+    const agent = ({
+      id: SessionId('no-listener'),
+      session,
+      status: 'idle',
+      followup: vi.fn(),
+      cancel: vi.fn(),
+      whenIdle: vi.fn(() => Promise.resolve()),
+    } satisfies Pick<Agent, 'id' | 'status' | 'session' | 'followup' | 'cancel' | 'whenIdle'>) as unknown as Agent
+    const sessions = {
+      get: vi.fn(() => session),
+      // `false` 是 store 的原生语义：没有任何持久化监听器参与。
+      flush: vi.fn(async () => false),
+    }
+    const ctx = {
+      on: vi.fn(() => () => {}),
+      logger: { warn: vi.fn(), error: vi.fn() },
+      agents: { create: vi.fn(async () => ({ agent, dispose: vi.fn(() => Promise.resolve()) })), get: () => agent },
+      get: (name: string) => name === 'sessions' ? sessions : undefined,
+    } as unknown as Context
+    const transport = new FakeTransport()
+    const server = new HarnessSdkJsonRpcServer(ctx, transport)
+    ;(server as unknown as { initialized: boolean }).initialized = true
+    await server.cancel({ sessionId: 'no-listener' })
+
+    // 没有持久化参与者时，写入的“已落盘到 seq N”是凭空成功证据。
+    expect(appended).not.toContain('session/flushed')
+    await server.shutdown()
   })
 
   it('starts a fresh settlement pass for work that began after an earlier idle drain', async () => {

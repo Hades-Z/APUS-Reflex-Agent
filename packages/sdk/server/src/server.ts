@@ -560,15 +560,22 @@ export class HarnessSdkJsonRpcServer {
       // live session to flush; only the store's real surface is awaited.
       const sessions = this.ctx.get('sessions')
       const store = typeof sessions?.get === 'function' && typeof sessions.flush === 'function'
-        ? sessions as { get(id: SessionId): Session | undefined; flush(session: Session): Promise<unknown> }
+        ? sessions as {
+          get(id: SessionId): Session | undefined
+          flush(session: Session): Promise<boolean>
+        }
         : undefined
       const live = store?.get(SessionId(sessionId))
       if (store !== undefined && live !== undefined) {
-        await this.withSettlementDeadline(Promise.resolve(store.flush(live)), sessionId)
-        // 屏障成功只是调用方可见的一个结论；把“已经落盘到哪一条”写进日志，
-        // 读者才能从原生日志核对，而不是相信一次通知。
+        // 覆盖范围在 flush 之前固定：等待期间可以有新事件进入内存，
+        // 只有这一刻之前的序号才是本次确认真正写进存储的部分。
         const throughSeq = Number(live.seq) - 1
-        if (throughSeq >= 0) {
+        const participated = await this.withSettlementDeadline(
+          Promise.resolve(store.flush(live)), sessionId,
+        )
+        // `false` 表示没有任何持久化监听器参与：此时没有“已落盘”这件事，
+        // 不能凭一次返回就写出成功确认。
+        if (participated !== false && throughSeq >= 0) {
           live.append('session/flushed', {
             sessionId: SessionId(sessionId),
             throughSeq: SessionSeq(throughSeq),
