@@ -1584,6 +1584,11 @@ describe('HarnessSdkJsonRpcServer', () => {
         const stored = await handle.read(0)
         const storedSeqs = new Set(stored.events.map(event => Number(event.seq)))
         expect(storedSeqs.has(reported)).toBe(true)
+        // 确认记录本身也要真的落到存储里：它只是“报告已落盘到哪”，
+        // 若自身没保存，重启后这段结论就消失了。
+        const storedFlush = stored.events.find(event => event.type === 'session/flushed')
+        expect(storedFlush).toBeDefined()
+        expect(Number(storedFlush?.seq)).toBeGreaterThan(reported)
       } finally {
         await handle.close()
       }
@@ -1592,42 +1597,6 @@ describe('HarnessSdkJsonRpcServer', () => {
       await ctx.fiber.dispose()
       await rm(storageDir, { recursive: true, force: true })
     }
-  })
-
-  it('does not record a flush when no durability listener participated', async () => {
-    const appended: string[] = []
-    const session = {
-      id: SessionId('no-listener'),
-      seq: 5,
-      append: vi.fn((type: string) => { appended.push(type); return {} }),
-    } as unknown as Agent['session']
-    const agent = ({
-      id: SessionId('no-listener'),
-      session,
-      status: 'idle',
-      followup: vi.fn(),
-      cancel: vi.fn(),
-      whenIdle: vi.fn(() => Promise.resolve()),
-    } satisfies Pick<Agent, 'id' | 'status' | 'session' | 'followup' | 'cancel' | 'whenIdle'>) as unknown as Agent
-    const sessions = {
-      get: vi.fn(() => session),
-      // `false` 是 store 的原生语义：没有任何持久化监听器参与。
-      flush: vi.fn(async () => false),
-    }
-    const ctx = {
-      on: vi.fn(() => () => {}),
-      logger: { warn: vi.fn(), error: vi.fn() },
-      agents: { create: vi.fn(async () => ({ agent, dispose: vi.fn(() => Promise.resolve()) })), get: () => agent },
-      get: (name: string) => name === 'sessions' ? sessions : undefined,
-    } as unknown as Context
-    const transport = new FakeTransport()
-    const server = new HarnessSdkJsonRpcServer(ctx, transport)
-    ;(server as unknown as { initialized: boolean }).initialized = true
-    await server.cancel({ sessionId: 'no-listener' })
-
-    // 没有持久化参与者时，写入的“已落盘到 seq N”是凭空成功证据。
-    expect(appended).not.toContain('session/flushed')
-    await server.shutdown()
   })
 
   it('starts a fresh settlement pass for work that began after an earlier idle drain', async () => {

@@ -575,11 +575,14 @@ export class HarnessSdkJsonRpcServer {
         )
         // `false` 表示没有任何持久化监听器参与：此时没有“已落盘”这件事，
         // 不能凭一次返回就写出成功确认。
-        if (participated !== false && throughSeq >= 0) {
+        if (participated === true && throughSeq >= 0) {
           live.append('session/flushed', {
             sessionId: SessionId(sessionId),
             throughSeq: SessionSeq(throughSeq),
           })
+          // 确认记录本身也必须持久化：它回答“已落盘到哪里”，若重启后这段结论
+          // 消失，读者就无法核对。再走一次屏障把它写入存储。
+          await this.withSettlementDeadline(Promise.resolve(store.flush(live)), sessionId)
         }
       }
     })().finally(() => {
