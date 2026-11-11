@@ -94,6 +94,23 @@ function subagentParentOf(carrier: Scoped<SubagentRuntime>): Agent {
   return carrierKeyOf(carrier) as Agent
 }
 
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionEventMap {
+    /**
+     * The Session log reached its durability barrier for an idle transition.
+     * Appended only after the settlement records and the storage flush both
+     * completed, so it answers "up to which seq is this session durably
+     * stored" from the log itself. Log-only and informational: losing it
+     * cannot change how the rest of the log is interpreted.
+     */
+    'session/flushed': {
+      sessionId: import('@deepseek-ai/dsh-session/types').SessionId
+      /** Last committed event seq the flush covered. */
+      throughSeq: import('@deepseek-ai/dsh-session/types').SessionSeq
+    }
+  }
+}
+
 /** Deployment-specific status mapping for SDK turn and subagent outcomes. */
 export interface HarnessSdkJsonRpcServerOptions {
   /** Report max-token termination as an accepted result instead of an infrastructure error. */
@@ -548,6 +565,15 @@ export class HarnessSdkJsonRpcServer {
       const live = store?.get(SessionId(sessionId))
       if (store !== undefined && live !== undefined) {
         await this.withSettlementDeadline(Promise.resolve(store.flush(live)), sessionId)
+        // 屏障成功只是调用方可见的一个结论；把“已经落盘到哪一条”写进日志，
+        // 读者才能从原生日志核对，而不是相信一次通知。
+        const throughSeq = Number(live.seq) - 1
+        if (throughSeq >= 0) {
+          live.append('session/flushed', {
+            sessionId: SessionId(sessionId),
+            throughSeq: SessionSeq(throughSeq),
+          })
+        }
       }
     })().finally(() => {
       // Only this pass may retire its own entry: a later turn can have

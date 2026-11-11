@@ -9,8 +9,8 @@
   en: e7c80d1de4d328b4
   zh: d9f368c27fd9f998
 /session-persistence-event-catalog/persistence-type-fingerprints:
-  en: 97ddd0da34ed7511
-  zh: 076841d2dc849b02
+  en: 7cea8e84ba445a2c
+  zh: 9315d1f9769ed339
 /session-persistence-event-catalog/event-envelope:
   en: 5becbbeb083355ee
   zh: 6f2d447ef04bd536
@@ -255,8 +255,11 @@
   en: a1ac8f2660a4f61e
   zh: a1ac8f2660a4f61e
 /session-persistence-event-catalog/events/session/session-end-seed-log-only:
-  en: cda0da9447d2f2b2
-  zh: eea2b2d8ae9a5912
+  en: 8ccc466c095e3cb9
+  zh: 641f70157945166b
+/session-persistence-event-catalog/events/session/session-flushed-log-only:
+  en: e63906f6202a0cab
+  zh: eb45dba37edf0535
 /session-persistence-event-catalog/events/session/session-title-log-only:
   en: 6c6a27578dff5828
   zh: 9a5add2bc0df2d0a
@@ -1602,8 +1605,11 @@
   en: 327b1b006be788bb
   zh: 327b1b006be788bb
 /session-persistence-event-catalog/resolved-persistence-types/session-end-seed:
-  en: 11d7c85934440b31
-  zh: 11d7c85934440b31
+  en: 58c39f27477f2379
+  zh: 58c39f27477f2379
+/session-persistence-event-catalog/resolved-persistence-types/session-flushed:
+  en: 165592b86202838e
+  zh: 165592b86202838e
 /session-persistence-event-catalog/resolved-persistence-types/session-title:
   en: 62b8205afbee4ff1
   zh: 62b8205afbee4ff1
@@ -3927,8 +3933,11 @@
   en: ac75607cae94426d
   zh: 9198767b6f2f74f6
 /session-persistence-event-catalog/resolved-persistence-types/sessionformatversion-sessionid-throughseq:
-  en: 8aaa02b06896492d
-  zh: 4dd0e1ee40d8f22d
+  en: ef586625f701b465
+  zh: 7a6ff7237454c7d8
+/session-persistence-event-catalog/resolved-persistence-types/sessionid-throughseq:
+  en: fdf3542c7ee56e95
+  zh: 250cd730fe5f2ef6
 /session-persistence-event-catalog/resolved-persistence-types/shadowedrange-shadowedseqs-shadowedtokencount:
   en: 3d910839a0e787c7
   zh: b1995ed29b7d885b
@@ -4143,8 +4152,11 @@
   en: d4dbca005a27b78b
   zh: b5792c3f38a6ba75
 /session-persistence-event-catalog/resolved-persistence-types/type-session-end-seed:
-  en: acf7e21e4d21ebff
-  zh: fb83a853634d204a
+  en: 2bc37dbf512fae91
+  zh: 325b45e9277463f8
+/session-persistence-event-catalog/resolved-persistence-types/type-session-flushed:
+  en: b43cd4f0dccadce3
+  zh: ff27e205e8571a77
 /session-persistence-event-catalog/resolved-persistence-types/type-session-title:
   en: 28d04867536d7b94
   zh: 85c6042d2b0d2cc5

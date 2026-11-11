@@ -78,6 +78,7 @@ The [format references](persistence-changes/historical-formats/README.md) cover 
 | `event:schedule/change` | event | `a0a2e5c42e1c929445ecd1cd70f49be6b66441894ec72c08e8ae332821d4a3cb` | [`{ type: "schedule/change" }`](#persistence-type-sha256-a0a2e5c42e1c929445ecd1cd70f49be6b66441894ec72c08e8ae332821d4a3cb) |
 | `event:session-log-deepseek/delivery-accepted` | event | `d63b8b8ffad9c02fd80c43a17df4f240c1fe8118ecca9de34f9d5871838ab5b9` | [`{ type: "session-log-deepseek/delivery-accepted" }`](#persistence-type-sha256-d63b8b8ffad9c02fd80c43a17df4f240c1fe8118ecca9de34f9d5871838ab5b9) |
 | `event:session/end-seed` | event | `5e6db6e24948d4a853c71cb9fabd252ad051ce93d4672c1266cf837c1c17b84e` | [`{ type: "session/end-seed" }`](#persistence-type-sha256-5e6db6e24948d4a853c71cb9fabd252ad051ce93d4672c1266cf837c1c17b84e) |
+| `event:session/flushed` | event | `1ef4c7e0eefff1ceef90bce6d860e01d17c31e2f105f70abe4c09ccf134ab90d` | [`{ type: "session/flushed" }`](#persistence-type-sha256-1ef4c7e0eefff1ceef90bce6d860e01d17c31e2f105f70abe4c09ccf134ab90d) |
 | `event:session/title` | event | `1b912703e2d64f91c99c675b8f805b01076c8325b905c1218ad81ef0b24909d5` | [`{ type: "session/title" }`](#persistence-type-sha256-1b912703e2d64f91c99c675b8f805b01076c8325b905c1218ad81ef0b24909d5) |
 | `event:session/title-llm-request` | event | `2119ad33d027df8d72be2aad1a3a76105f41a5fde731a3913ee8631130429391` | [`{ type: "session/title-llm-request" }`](#persistence-type-sha256-2119ad33d027df8d72be2aad1a3a76105f41a5fde731a3913ee8631130429391) |
 | `event:skill/loaded` | event | `960d0d368eb8e26ba92090024267e3307c43f94979b9bf035259470495386d98` | [`{ type: "skill/loaded" }`](#persistence-type-sha256-960d0d368eb8e26ba92090024267e3307c43f94979b9bf035259470495386d98) |
@@ -1255,6 +1256,27 @@ Source: [`packages/schedule/schedule/src/types.ts:358`](../packages/schedule/sch
 ```
 
 Source: [`packages/core/session/src/types.ts:496`](../packages/core/session/src/types.ts)
+
+<a id="sessionflushed--log-only"></a>
+
+#### `session/flushed` — log-only
+
+```ts persistence-catalog
+/**
+ * The Session log reached its durability barrier for an idle transition.
+ * Appended only after the settlement records and the storage flush both
+ * completed, so it answers "up to which seq is this session durably
+ * stored" from the log itself. Log-only and informational: losing it
+ * cannot change how the rest of the log is interpreted.
+ */
+'session/flushed': {
+  sessionId: import('@deepseek-ai/dsh-session/types').SessionId
+  /** Last committed event seq the flush covered. */
+  throughSeq: import('@deepseek-ai/dsh-session/types').SessionSeq
+}
+```
+
+Source: [`packages/sdk/server/src/server.ts:106`](../packages/sdk/server/src/server.ts)
 
 <a id="sessiontitle--log-only"></a>
 
@@ -5250,6 +5272,14 @@ SHA-256: `7f13860ee89a2d35ce09f958e85a04566cd59cb1de1d73a9619a9b631961dc71`
 SHA-256: `1c2686c0682e7bc51d61117b2652bd4a80707e331aa276d6ef915ae32534a330`
 
 `"session/end-seed"`
+
+<a id="persistence-type-sha256-28e90df2318df218d3703fcad305ce1d11ee502cfe4f4dafa1d5ff351a3e5f63"></a>
+
+### `"session/flushed"`
+
+SHA-256: `28e90df2318df218d3703fcad305ce1d11ee502cfe4f4dafa1d5ff351a3e5f63`
+
+`"session/flushed"`
 
 <a id="persistence-type-sha256-7a651f3b672c52fb615f22c0ce9cb3cc5b22aad92e6bbeefb0808fd7b9233a50"></a>
 
@@ -16281,6 +16311,19 @@ Sources: [`packages/session/session-log-deepseek/src/types.ts:81`](../packages/s
 | `sessionId` | required | `string` |
 | `throughSeq` | required | `number` |
 
+<a id="persistence-type-sha256-09c4e39433565d24c20ce90f64125f9bde4e8b9680652455f8cf058e47299c6f"></a>
+
+### `{ sessionId, throughSeq }`
+
+SHA-256: `09c4e39433565d24c20ce90f64125f9bde4e8b9680652455f8cf058e47299c6f`
+
+Sources: [`packages/sdk/server/src/server.ts:106`](../packages/sdk/server/src/server.ts)
+
+| Property | Presence | Type |
+|---|---|---|
+| `sessionId` | required | `string` |
+| `throughSeq` | required | `number` |
+
 <a id="persistence-type-sha256-5dd766ccd1702a1142ad8b4bd44f2242f8e8a6752669ad3de0a5d224329b1438"></a>
 
 ### `{ shadowedRange, shadowedSeqs, shadowedTokenCount }`
@@ -17402,6 +17445,22 @@ SHA-256: `5e6db6e24948d4a853c71cb9fabd252ad051ce93d4672c1266cf837c1c17b84e`
 | `seq` | required | `number` |
 | `time` | required | `number` |
 | `type` | required | `"session/end-seed"` |
+
+<a id="persistence-type-sha256-1ef4c7e0eefff1ceef90bce6d860e01d17c31e2f105f70abe4c09ccf134ab90d"></a>
+
+<a id="persistence-type-eventsessionflushed"></a>
+
+### `{ type: "session/flushed" }`
+
+SHA-256: `1ef4c7e0eefff1ceef90bce6d860e01d17c31e2f105f70abe4c09ccf134ab90d`
+
+| Property | Presence | Type |
+|---|---|---|
+| `data` | required | [`{ sessionId, throughSeq }`](#persistence-type-sha256-09c4e39433565d24c20ce90f64125f9bde4e8b9680652455f8cf058e47299c6f) |
+| `ignorable` | optional | `true` |
+| `seq` | required | `number` |
+| `time` | required | `number` |
+| `type` | required | `"session/flushed"` |
 
 <a id="persistence-type-sha256-1b912703e2d64f91c99c675b8f805b01076c8325b905c1218ad81ef0b24909d5"></a>
 

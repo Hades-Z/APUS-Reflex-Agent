@@ -19733,6 +19733,81 @@
       }
     },
     {
+      "key": "event:session/flushed",
+      "kind": "event",
+      "event": "session/flushed",
+      "surface": false,
+      "digest": "1ef4c7e0eefff1ceef90bce6d860e01d17c31e2f105f70abe4c09ccf134ab90d",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 4,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 5,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "sessionId",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "throughSeq",
+                "type": 3,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "session/flushed"
+          }
+        ]
+      }
+    },
+    {
       "key": "event:session/title",
       "kind": "event",
       "event": "session/title",
@@ -45545,6 +45620,42 @@
       "sources": []
     },
     {
+      "digest": "09c4e39433565d24c20ce90f64125f9bde4e8b9680652455f8cf058e47299c6f",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "sessionId",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "throughSeq",
+                "type": 2,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          }
+        ]
+      },
+      "names": [],
+      "sources": [
+        "packages/sdk/server/src/server.ts:106"
+      ]
+    },
+    {
       "digest": "09f3f8dc417f278257202714132f98ba7b52957d7b558c4a04456603890eb363",
       "schema": {
         "root": 0,
@@ -57345,6 +57456,79 @@
       ]
     },
     {
+      "digest": "1ef4c7e0eefff1ceef90bce6d860e01d17c31e2f105f70abe4c09ccf134ab90d",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 4,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 5,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "sessionId",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "throughSeq",
+                "type": 3,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "session/flushed"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
       "digest": "1efaad73e3bc1416dd527d882fc495803af98e0ca5afb4bcf5dbd93b706d948a",
       "schema": {
         "root": 0,
@@ -67202,6 +67386,20 @@
           {
             "kind": "literal",
             "value": "overtime"
+          }
+        ]
+      },
+      "names": [],
+      "sources": []
+    },
+    {
+      "digest": "28e90df2318df218d3703fcad305ce1d11ee502cfe4f4dafa1d5ff351a3e5f63",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "literal",
+            "value": "session/flushed"
           }
         ]
       },

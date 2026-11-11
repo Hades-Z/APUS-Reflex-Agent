@@ -1567,6 +1567,14 @@ describe('HarnessSdkJsonRpcServer', () => {
       expect(dispatch).toBeDefined()
       expect(events.some(event => event.type === 'llm/dispatch-settled'
         && event.data.dispatchSeq === (dispatch as { seq: number }).seq)).toBe(true)
+      // 屏障成功本身只是通知上的一个词；要能回答“已持久化到哪里”，这份事实
+      // 必须落在会话日志里，读者才能从原生日志核对，而不是信任一次回调。
+      const flush = events.find(event => event.type === 'session/flushed')
+      expect(flush).toBeDefined()
+      expect((flush as { data: { sessionId: string; throughSeq: number } }).data.sessionId)
+        .toBe('settled-idle')
+      expect((flush as { data: { throughSeq: number } }).data.throughSeq)
+        .toBeGreaterThanOrEqual((events.at(-1) as { seq: number }).seq - 1)
       await server.shutdown()
     } finally {
       await ctx.fiber.dispose()
