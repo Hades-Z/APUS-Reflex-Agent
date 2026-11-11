@@ -583,6 +583,13 @@ export class HarnessSdkJsonRpcServer {
           // 确认记录本身也必须持久化：它回答“已落盘到哪里”，若重启后这段结论
           // 消失，读者就无法核对。再走一次屏障把它写入存储。
           await this.withSettlementDeadline(Promise.resolve(store.flush(live)), sessionId)
+        } else if (participated !== true) {
+          // 没有任何持久化监听器参与：这一次没有“已落盘”的事实可报告。
+          // 不能静默通过——调用方会看到 settled，却找不到落盘证据。
+          this.ctx.logger.warn(
+            `session "${sessionId}": flush reported no durability participant; `
+            + 'no session/flushed record was written',
+          )
         }
       }
     })().finally(() => {
